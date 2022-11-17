@@ -82,6 +82,7 @@ function getPaymentRef($db = null, $oID, $module)
             break;
 
         case 'square':
+	case 'square_webPay':
             $query = 'SELECT sq_order from ' . TABLE_SQUARE_PAYMENTS . ' where order_id = ' . $oID;
             $result = $db->Execute( $query );
             if( $result->fields['sq_order'] )
@@ -387,7 +388,16 @@ function getOrders($db = null, $last_order)
                 array_push($orderItems, $ot_items['shipping']);
 
             if( array_key_exists( 'taxamo_assure', $ot_items ) )
+            {
                 array_push($orderItems, $ot_items['taxamo_assure']);
+                
+                $taxamo = new taxamo_assure();
+                $transaction = $taxamo->GetOrderTransaction( $order["orderId"] );
+                if( $transaction != NULL )
+                {
+                    $order['taxamo_assure'] = $transaction;
+                }
+            }
 
             $order["items"] = $orderItems;
             array_push($orders, $order);
@@ -697,27 +707,37 @@ function updateProductQuantity($db = null, $data)
     $notUpdated = array();
     foreach ($products as $product) {
         $products_model = $product["products_model"];
-        $quantity = 0.0 + $product["quantity"];
-        if( $quantity < 0 )
-            $quantity = 0;
+        $sql_data_array = array();
+        
+        if( isset($product["quantity"]) ) {
+            $quantity = 0.0 + $product["quantity"];
+            if( $quantity < 0 )
+                $quantity = 0;
+                
+            $sql_data_array ['products_quantity'] = $quantity;
+        }
 		
-        $sql = "SELECT products_id FROM " . TABLE_PRODUCTS . " WHERE products_model = '" . $products_model . "'";
-        $result = $db->Execute($sql);
+        if( isset($product["price"]) ) {
+            $price = 0.0 + $product["price"];
+            $sql_data_array ['products_price'] = $price;
+        }
+		
+        if( !empty( $sql_data_array ) ) {
+            $sql = "SELECT products_id FROM " . TABLE_PRODUCTS . " WHERE products_model = '" . $products_model . "'";
+            $result = $db->Execute($sql);
 
-        if (isset($result) && $result->fields['products_id']) {
+            if( isset($result) && $result->fields['products_id'] ) {
 
-            $sql_data_array = array(
-                'products_quantity' => $quantity
-            );
-            zen_db_perform(
-                TABLE_PRODUCTS,
-                $sql_data_array,
-                'update',
-                "products_id = " . (int) $result->fields['products_id']
-            );
-            array_push($updated, $products_model);
-        } else {
-            array_push($notUpdated, $products_model);
+                zen_db_perform(
+                    TABLE_PRODUCTS,
+                    $sql_data_array,
+                    'update',
+                    "products_id = " . (int) $result->fields['products_id']
+                );
+                array_push($updated, $products_model);
+            } else {
+                array_push($notUpdated, $products_model);
+            }
         }
     }
     $status = 1;
