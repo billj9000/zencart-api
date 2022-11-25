@@ -2,7 +2,7 @@
 /*
  * ERPNext Plugin for Zen Cart
  * 
- * Version 1.0
+ * Version 1.0.1
  *
  * Copyright (c) 2022 SAABits Ltd
  *
@@ -27,7 +27,7 @@ require('includes/application_top.php');
 
 header('Content-Type: application/json');
 
-$VERSION = "1.0.0";
+$VERSION = "1.0.1";
 
 define('ZENCART_PRODUCT_TAX_CLASS_ID',1); // sets the record id for the default sales tax to use
 
@@ -411,7 +411,7 @@ function getOrders($db = null, $last_order)
 /**
  * Update order comments
  */
-function uploadTracking($db = null, $data)
+function updateOrderComments($db = null, $data)
 {
     if ($data['orderId'] && $data['comment']) {
         $customer_notified = '1';
@@ -419,12 +419,16 @@ function uploadTracking($db = null, $data)
         $result = $db->Execute($sql);
 
         if (isset($result) && $result->fields['orders_id']) {
-            $status = 4;
+            if( $data['status'] ) {
+                $status = $data['status'];
+            } else {
+                $status = 4;
+            }
 
             $status_updated = zen_update_orders_history(
                 $data['orderId'],
                 $data['comment'],
-                "ERP system",
+                "ERP",
                 $status,
                 $customer_notified,
                 true
@@ -788,8 +792,8 @@ if (isset($_REQUEST['task'])) {
         // check POST
         $json = file_get_contents('php://input');
         $data = json_decode($json, true);
-        if ($_REQUEST['task'] == 'uploadTracking') {
-            uploadTracking($db, $data);
+        if ($_REQUEST['task'] == 'updateOrderComments') {
+            updateOrderComments($db, $data);
         } else if ($_REQUEST['task'] == 'updateProductsQty') {
             updateProductQuantity($db, $data);
         } else if ($_REQUEST['task'] == 'updateProducts') {
