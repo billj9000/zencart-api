@@ -64,6 +64,8 @@ function checkAccess($db = null)
  */
 function getPaymentRef($db = null, $oID, $module)
 {
+    global $sniffer;
+    
     // There is no consistent API for this in Zen Cart so we have to treat each
     // payment method individually and if we install a new payment module we need
     // to add a new handler for it here
@@ -83,9 +85,18 @@ function getPaymentRef($db = null, $oID, $module)
 
         case 'square':
 	case 'square_webPay':
-            $query = 'SELECT sq_order from ' . TABLE_SQUARE_PAYMENTS . ' where order_id = ' . $oID;
+            // Check whether this version of Square module supports the receipt_id field
+            $receiptOk = (method_exists($sniffer, 'field_exists')) ? $sniffer->field_exists(TABLE_SQUARE_PAYMENTS, 'receipt_id') : false;
+            if ($receiptOk !== true) {
+                $query = 'SELECT sq_order, receipt_id from ' . TABLE_SQUARE_PAYMENTS . ' where order_id = ' . $oID;
+	    } else {
+                $query = 'SELECT sq_order from ' . TABLE_SQUARE_PAYMENTS . ' where order_id = ' . $oID;
+	    }
+	    
             $result = $db->Execute( $query );
-            if( $result->fields['sq_order'] )
+	    if( !empty( $result->fields['receipt_id'] ) )
+                $ref = $result->fields['receipt_id'];
+	    elseif( $result->fields['sq_order'] )
                 $ref = $result->fields['sq_order'];
             break;
     }
