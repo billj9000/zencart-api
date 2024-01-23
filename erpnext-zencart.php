@@ -94,11 +94,18 @@ function getPaymentRef($db = null, $oID, $module)
 	    }
 	    
             $result = $db->Execute( $query );
-	    if( !empty( $result->fields['receipt_id'] ) )
+            if( $result->fields['receipt_id'] )
                 $ref = $result->fields['receipt_id'];
 	    elseif( $result->fields['sq_order'] )
                 $ref = $result->fields['sq_order'];
             break;
+	    
+	case 'braintree_api':
+	    $query = 'SELECT txn_id from ' . TABLE_BRAINTREE . ' where order_id = ' . $oID;
+            $result = $db->Execute( $query );
+            if( $result->fields['txn_id'] )
+                $ref = $result->fields['txn_id'];
+	    break;
     }
 
     return $ref;
