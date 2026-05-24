@@ -198,12 +198,6 @@ function get_orders($db, int $last_order): void
             $first_comment = $hist->EOF ? '' : $hist->fields['comments'];
         }
 
-        // Shipping total
-        $ship_row = $db->Execute(
-            "SELECT value FROM " . TABLE_ORDERS_TOTAL
-            . " WHERE orders_id = " . $order_id . " AND class = 'ot_shipping' LIMIT 1"
-        );
-
         $order = [
             'orderId'        => $order_id,
             'orderDate'      => $result->fields['date_purchased'],
@@ -218,7 +212,8 @@ function get_orders($db, int $last_order): void
             'conversionRate' => (float)$result->fields['currency_value'],
             'totalAmount'    => (float)$result->fields['order_total'],
             'taxAmount'      => (float)$result->fields['order_tax'],
-            'shippingAmount' => $ship_row->EOF ? 0.0 : (float)$ship_row->fields['value'],
+            'shippingAmount' => 0.0,
+            'shippingTax'    => 0.0,
             'comments'       => $first_comment,
             'customerId'     => (int)$result->fields['customers_id'],
             'email'          => $result->fields['customers_email_address'],
@@ -321,7 +316,7 @@ function get_orders($db, int $last_order): void
         $ot_extra = [];
         $dest_country = $order['shippingAddress']['country'];
         while (!$totals_result->EOF) {
-            $ot_vat = ($dest_country === 'United Kingdom') ? $vat_rate : 0.0;
+            $ot_vat = $vat_rate;
             $raw    = (float)$totals_result->fields['value'];
             $title  = strip_tags($totals_result->fields['title']);
             switch ($totals_result->fields['class']) {
@@ -335,13 +330,8 @@ function get_orders($db, int $last_order): void
                     ];
                     break;
                 case 'ot_shipping':
-                    $ot_extra['shipping'] = [
-                        'sku'       => 'Shipping',
-                        'name'      => $title,
-                        'quantity'  => 1,
-                        'unitPrice' => $raw / (1 + $ot_vat / 100),
-                        'tax'       => $ot_vat,
-                    ];
+                    $order['shippingAmount'] = $raw / (1 + $ot_vat / 100);
+                    $order['shippingTax']    = $ot_vat;
                     break;
                 case 'ot_taxamo_assure':
                     if ($dest_country !== 'United Kingdom' && $vat_rate != 0) {
@@ -358,7 +348,7 @@ function get_orders($db, int $last_order): void
             $totals_result->MoveNext();
         }
 
-        foreach (['coupon', 'shipping', 'taxamo_assure'] as $key) {
+        foreach (['coupon', 'taxamo_assure'] as $key) {
             if (isset($ot_extra[$key])) {
                 $items[] = $ot_extra[$key];
             }
