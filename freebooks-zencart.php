@@ -410,6 +410,12 @@ function update_order_comments($db, array $data): void
 
 function update_products($db, array $data): void
 {
+    if (!defined('TABLE_PRODUCTS_DISCOUNT_QUANTITY')) {
+        define('TABLE_PRODUCTS_DISCOUNT_QUANTITY', DB_PREFIX . 'products_discount_quantity');
+    }
+    $tbl_check = $db->Execute("SHOW TABLES LIKE '" . DB_PREFIX . "products_discount_quantity'");
+    $has_qty_discount_table = !$tbl_check->EOF;
+
     $products    = $data['products'] ?? [];
     $added       = [];
     $updated     = [];
@@ -554,8 +560,8 @@ function update_products($db, array $data): void
 
         if (!empty($product['priceDiscountType'])) {
             $prod_row['products_discount_type']      = (int)$product['priceDiscountType'];
-            $prod_row['products_quantity_order_min'] = $product['price_levels'][1]['qty'] ?? 1;
-            $prod_row['products_price']              = (float)($product['price_levels'][1]['amount'] ?? 0);
+            $prod_row['products_quantity_order_min'] = (int)($product['price_levels'][0]['qty'] ?? 1);
+            $prod_row['products_price']              = (float)($product['price_levels'][0]['amount'] ?? 0);
         } else {
             $prod_row['products_discount_type'] = 0;
             if (isset($product['retailPrice'])) {
@@ -599,6 +605,21 @@ function update_products($db, array $data): void
             zen_db_perform(TABLE_PRODUCTS_DESCRIPTION, $desc_row, 'update',
                 "products_id = " . $prod_id . " AND language_id = " . $lang_id);
             $updated[] = $sku;
+        }
+
+        // Write quantity-tier discount rows. Always wipe and rewrite so stale tiers don't accumulate.
+        if ($has_qty_discount_table) {
+            $db->Execute("DELETE FROM " . TABLE_PRODUCTS_DISCOUNT_QUANTITY . " WHERE products_id = " . $prod_id);
+            if (!empty($product['price_levels']) && !empty($product['priceDiscountType'])) {
+                foreach ($product['price_levels'] as $tier) {
+                    $db->Execute(
+                        "INSERT INTO " . TABLE_PRODUCTS_DISCOUNT_QUANTITY
+                        . " SET products_id = " . $prod_id
+                        . ", discount_qty = " . (int)($tier['qty'] ?? 0)
+                        . ", discount_price = " . (float)($tier['amount'] ?? 0)
+                    );
+                }
+            }
         }
     }
 
