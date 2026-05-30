@@ -309,7 +309,7 @@ function get_orders($db, int $last_order): void
             $prod_result->MoveNext();
         }
 
-        // Order totals — coupon, shipping, Taxamo as extra line items
+        // Order totals — coupon, shipping, and other fee modules as extra line items
         $totals_result = $db->Execute(
             "SELECT class, title, value FROM " . TABLE_ORDERS_TOTAL . " WHERE orders_id = " . $order_id
         );
@@ -344,11 +344,33 @@ function get_orders($db, int $last_order): void
                         ];
                     }
                     break;
+                case 'ot_dhl_landedcost':
+                    if ($raw > 0.0) {
+                        $ot_extra['dhl_landedcost'] = [
+                            'sku'       => 'DHL_LANDEDCOST',
+                            'name'      => $title,
+                            'quantity'  => 1,
+                            'unitPrice' => $raw,
+                            'tax'       => 0.0,
+                        ];
+                    }
+                    break;
+                case 'ot_easproject_ioss':
+                    if ($raw > 0.0) {
+                        $ot_extra['easproject_ioss'] = [
+                            'sku'       => 'IOSS_VAT',
+                            'name'      => $title,
+                            'quantity'  => 1,
+                            'unitPrice' => $raw,
+                            'tax'       => 0.0,
+                        ];
+                    }
+                    break;
             }
             $totals_result->MoveNext();
         }
 
-        foreach (['coupon', 'taxamo_assure'] as $key) {
+        foreach (['coupon', 'taxamo_assure', 'dhl_landedcost', 'easproject_ioss'] as $key) {
             if (isset($ot_extra[$key])) {
                 $items[] = $ot_extra[$key];
             }
