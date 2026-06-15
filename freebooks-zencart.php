@@ -62,7 +62,11 @@ function api_error(string $message, int $http_status = 400): void
 
 function check_access($db): void
 {
-    $header = $_SERVER['HTTP_AUTHORIZATION'] ?? '';
+    // Apache may strip Authorization before it reaches $_SERVER; check fallbacks.
+    $header = $_SERVER['HTTP_AUTHORIZATION']
+        ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION']
+        ?? (function_exists('apache_request_headers') ? (apache_request_headers()['Authorization'] ?? '') : '')
+        ?? '';
     if (!preg_match('/^Bearer\s+(\S+)$/i', $header, $m)) {
         api_error('Missing or malformed Authorization header', 401);
     }
@@ -428,6 +432,23 @@ function update_products($db, array $data): void
     $tbl_check = $db->Execute("SHOW TABLES LIKE '" . DB_PREFIX . "products_discount_quantity'");
     $has_qty_discount_table = !$tbl_check->EOF;
 
+    $col = static function (string $col) use ($db): bool {
+        return !$db->Execute("SHOW COLUMNS FROM " . TABLE_PRODUCTS . " LIKE '" . $col . "'")->EOF;
+    };
+    $has_additional_skus        = $col('additional_skus');
+    $has_products_condition     = $col('products_condition');
+    $has_products_dim_type      = $col('products_dim_type');
+    $has_ships_in_own_box       = $col('product_ships_in_own_box');
+    $has_ready_to_ship          = $col('products_ready_to_ship');
+    $has_hs_code                = $col('hs_code');
+    $has_country_of_origin      = $col('country_of_origin');
+    $has_zc_length              = $col('products_length');
+    $has_zc_width               = $col('products_width');
+    $has_zc_height              = $col('products_height');
+    $has_custom_length          = $col('product_length');
+    $has_custom_width           = $col('product_width');
+    $has_custom_height          = $col('product_height');
+
     $products    = $data['products'] ?? [];
     $added       = [];
     $updated     = [];
@@ -462,16 +483,19 @@ function update_products($db, array $data): void
         }
         $type_id = (int)$type_row->fields['type_id'];
 
-        // Manufacturer
+        // Manufacturer — optional; 0 means none in ZenCart
         $mfr_name = (string)($product['manufacturer'] ?? '');
-        $mfr_row  = $db->Execute(
-            "SELECT manufacturers_id FROM " . TABLE_MANUFACTURERS
-            . " WHERE manufacturers_name = '" . zen_db_input($mfr_name) . "' LIMIT 1"
-        );
-        if ($mfr_row->EOF) {
-            api_error('Bad manufacturer: ' . $mfr_name . ' (' . $sku . ')');
+        $mfr_id   = 0;
+        if ($mfr_name !== '') {
+            $mfr_row = $db->Execute(
+                "SELECT manufacturers_id FROM " . TABLE_MANUFACTURERS
+                . " WHERE manufacturers_name = '" . zen_db_input($mfr_name) . "' LIMIT 1"
+            );
+            if ($mfr_row->EOF) {
+                api_error('Bad manufacturer: ' . $mfr_name . ' (' . $sku . ')');
+            }
+            $mfr_id = (int)$mfr_row->fields['manufacturers_id'];
         }
-        $mfr_id = (int)$mfr_row->fields['manufacturers_id'];
 
         // Category — must be a leaf (no sub-categories)
         $cat_name = (string)($product['productCategory'] ?? '');
@@ -521,7 +545,6 @@ function update_products($db, array $data): void
         // Build products table row
         $tax_class_id = !empty($product['productTaxable']) ? FB_DEFAULT_TAX_CLASS_ID : 0;
         $prod_row = [
-            'phreebooks_sku'       => $sku,
             'products_model'       => $sku,
             'products_type'        => $type_id,
             'manufacturers_id'     => $mfr_id,
@@ -549,23 +572,42 @@ function update_products($db, array $data): void
             $prod_row['products_sort_order']      = (int)$product['productZencartSortOrder'];
         elseif (isset($product['productSortOrder']))
             $prod_row['products_sort_order']      = (int)$product['productSortOrder'];
-        if (isset($product['productZencartOemPartnumbers']) && is_string($product['productZencartOemPartnumbers']))
-            $prod_row['additional_skus']          = $product['productZencartOemPartnumbers'];
-        if (isset($product['productZencartCondition']))
-            $prod_row['products_condition']       = $product['productZencartCondition'];
-        if (isset($product['productZencartDimUnits']))
+        // Dimensions: prefer standard ZenCart columns, fall back to custom columns
+        if (isset($product['productZencartLength'])) {
+            if ($has_zc_length)
+                $prod_row['products_length'] = (float)$product['productZencartLength'];
+            elseif ($has_custom_length)
+                $prod_row['product_length']  = (float)$product['productZencartLength'];
+        }
+        if (isset($product['productZencartWidth'])) {
+            if ($has_zc_width)
+                $prod_row['products_width']  = (float)$product['productZencartWidth'];
+            elseif ($has_custom_width)
+                $prod_row['product_width']   = (float)$product['productZencartWidth'];
+        }
+        if (isset($product['productZencartHeight'])) {
+            if ($has_zc_height)
+                $prod_row['products_height'] = (float)$product['productZencartHeight'];
+            elseif ($has_custom_height)
+                $prod_row['product_height']  = (float)$product['productZencartHeight'];
+        }
+        // productZencartDimUnits (dimension unit type) — only if column exists
+        if (isset($product['productZencartDimUnits']) && $has_products_dim_type)
             $prod_row['products_dim_type']        = $product['productZencartDimUnits'];
-        if (isset($product['productZencartLength']))
-            $prod_row['products_length']          = (float)$product['productZencartLength'];
-        if (isset($product['productZencartWidth']))
-            $prod_row['products_width']           = (float)$product['productZencartWidth'];
-        if (isset($product['productZencartHeight']))
-            $prod_row['products_height']          = (float)$product['productZencartHeight'];
-        if (isset($product['productZencartReadyToShip']))
-            $prod_row['products_ready_to_ship']   = $product['productZencartReadyToShip'];
-        if (isset($product['productHsCode']))
+        // Ready-to-ship: ZenCart 2.x renamed the column
+        if (isset($product['productZencartReadyToShip'])) {
+            if ($has_ships_in_own_box)
+                $prod_row['product_ships_in_own_box'] = (int)$product['productZencartReadyToShip'];
+            elseif ($has_ready_to_ship)
+                $prod_row['products_ready_to_ship']   = (int)$product['productZencartReadyToShip'];
+        }
+        if (isset($product['productZencartOemPartnumbers']) && is_string($product['productZencartOemPartnumbers']) && $has_additional_skus)
+            $prod_row['additional_skus']          = $product['productZencartOemPartnumbers'];
+        if (isset($product['productZencartCondition']) && $has_products_condition)
+            $prod_row['products_condition']       = $product['productZencartCondition'];
+        if (isset($product['productHsCode']) && $has_hs_code)
             $prod_row['hs_code']                  = $product['productHsCode'];
-        if (isset($product['productCountryOrigin']))
+        if (isset($product['productCountryOrigin']) && $has_country_of_origin)
             $prod_row['country_of_origin']        = $product['productCountryOrigin'];
         if ($tax_class_id)
             $prod_row['products_tax_class_id']    = $tax_class_id;
