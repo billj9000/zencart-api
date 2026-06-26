@@ -90,10 +90,10 @@ function check_access($db): void
 // ZenCart 1.5.x signature: zen_update_orders_history($oID, $message, $updated_by, $status, $notify, $notify_comments)
 // ZenCart 2.x retains the same function name; $updated_by moved to a later parameter in some builds.
 // We prefer the native function; if absent (stripped installs) we insert directly.
-function fb_update_order_history($db, int $order_id, string $comment, int $status, int $notify): int
+function fb_update_order_history($db, int $order_id, string $comment, int $status, int $notify, string $updated_by = 'FreeBooks'): int
 {
     if (function_exists('zen_update_orders_history')) {
-        return (int) zen_update_orders_history($order_id, $comment, 'FreeBooks', $status, $notify, false);
+        return (int) zen_update_orders_history($order_id, $comment, $updated_by, $status, $notify, true);
     }
 
     // Fallback: manual insert + order status update
@@ -104,7 +104,8 @@ function fb_update_order_history($db, int $order_id, string $comment, int $statu
             . $order_id . ", "
             . $status . ", NOW(), "
             . $notify . ", '"
-            . zen_db_input($comment) . "', 'FreeBooks')"
+            . zen_db_input($comment) . "', '"
+            . zen_db_input($updated_by) . "')"
     );
     $db->Execute(
         "UPDATE " . TABLE_ORDERS
@@ -413,8 +414,10 @@ function update_order_comments($db, array $data): void
         api_error('Order ' . $order_id . ' not found', 404);
     }
 
-    $status = isset($data['status']) ? (int)$data['status'] : 4;
-    $result = fb_update_order_history($db, $order_id, $comment, $status, 1);
+    $status     = isset($data['status']) ? (int)$data['status'] : 4;
+    $updated_by = isset($data['updatedBy']) ? trim((string)$data['updatedBy']) : 'FreeBooks';
+    if ($updated_by === '') $updated_by = 'FreeBooks';
+    $result = fb_update_order_history($db, $order_id, $comment, $status, 1, $updated_by);
     if ($result > 0) {
         api_ok(['message' => 'Order ' . $order_id . ' updated']);
     } else {
