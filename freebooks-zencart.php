@@ -191,17 +191,15 @@ function get_orders($db, int $last_order): void
         $order_status    = $status_row->EOF ? 'unknown' : $status_row->fields['orders_status_name'];
         $order_status_id = $status_row->EOF ? null : (int)$status_row->fields['orders_status_id'];
 
-        // First non-empty comment from history
-        $first_comment = '';
-        if ($order_status_id !== null) {
-            $hist = $db->Execute(
-                "SELECT comments FROM " . TABLE_ORDERS_STATUS_HISTORY
-                . " WHERE orders_id = " . $order_id
-                . " AND comments IS NOT NULL AND comments != ''"
-                . " ORDER BY date_added ASC LIMIT 1"
-            );
-            $first_comment = $hist->EOF ? '' : $hist->fields['comments'];
-        }
+        // The first orders_status_history entry (lowest ID) is always the checkout comment,
+        // inserted by order->create() before any payment module's after_process() runs.
+        // We read it unconditionally; empty means no comment was left.
+        $hist = $db->Execute(
+            "SELECT comments FROM " . TABLE_ORDERS_STATUS_HISTORY
+            . " WHERE orders_id = " . $order_id
+            . " ORDER BY orders_status_history_id ASC LIMIT 1"
+        );
+        $first_comment = $hist->EOF ? '' : (string)($hist->fields['comments'] ?? '');
 
         $order = [
             'orderId'        => $order_id,
