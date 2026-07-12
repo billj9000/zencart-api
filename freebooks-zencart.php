@@ -36,7 +36,7 @@ require('includes/application_top.php');
 header('Content-Type: application/json');
 header('X-Content-Type-Options: nosniff');
 
-define('FB_API_VERSION', 2);
+define('FB_API_VERSION', 3);
 define('FB_DEFAULT_TAX_CLASS_ID', 1);
 
 // ─── Response helpers ────────────────────────────────────────────────────────
@@ -673,6 +673,233 @@ function update_products($db, array $data): void
                         . ", discount_qty = " . (int)($tier['qty'] ?? 0)
                         . ", discount_price = " . (float)($tier['amount'] ?? 0)
                     );
+                }
+            }
+        }
+
+        // ── Attribute upsert (Master Stock options/variants) ───────────────────
+        // Runs only when FreeBooks sends an 'attributes' block. Writes native ZenCart
+        // products_options / products_options_values / products_attributes tables
+        // (vanilla ZenCart 1.5.8+). A dormant POSM branch is gated behind a
+        // SHOW TABLES check — it activates automatically when the plugin is installed
+        // with no change required on the FreeBooks side.
+        if (!empty($product['attributes'])) {
+            $attr_options  = $product['attributes']['options']  ?? [];
+            $attr_variants = $product['attributes']['variants'] ?? [];
+
+            // Capability detection (done once per request, cached in static)
+            static $posm_available = null;
+            if ($posm_available === null) {
+                $posm_check   = $db->Execute(
+                    "SHOW TABLES LIKE '" . DB_PREFIX . "products_options_stock'"
+                );
+                $posm_available = !$posm_check->EOF;
+                if ($posm_available) {
+                    define('TABLE_PRODUCTS_OPTIONS_STOCK',
+                        DB_PREFIX . 'products_options_stock');
+                    define('TABLE_PRODUCTS_OPTIONS_STOCK_ATTRIBUTES',
+                        DB_PREFIX . 'products_options_stock_attributes');
+                }
+            }
+
+            // Resolve or create a products_options row by name (language_id=1).
+            // Returns the options_id.
+            $resolve_option = static function (string $name) use ($db): int {
+                $row = $db->Execute(
+                    "SELECT products_options_id FROM " . TABLE_PRODUCTS_OPTIONS
+                    . " WHERE products_options_name = '" . zen_db_input($name) . "'"
+                    . "   AND language_id = 1 LIMIT 1"
+                );
+                if (!$row->EOF) return (int)$row->fields['products_options_id'];
+                $max = $db->Execute("SELECT COALESCE(MAX(products_options_id),0) AS m FROM " . TABLE_PRODUCTS_OPTIONS);
+                $new_id = (int)$max->fields['m'] + 1;
+                $langs  = $db->Execute("SELECT languages_id FROM " . TABLE_LANGUAGES);
+                while (!$langs->EOF) {
+                    $db->Execute(
+                        "INSERT IGNORE INTO " . TABLE_PRODUCTS_OPTIONS
+                        . " (products_options_id, language_id, products_options_name, products_options_type)"
+                        . " VALUES (" . $new_id . ", " . (int)$langs->fields['languages_id']
+                        . ", '" . zen_db_input($name) . "', 0)"
+                    );
+                    $langs->MoveNext();
+                }
+                return $new_id;
+            };
+
+            // Resolve or create a products_options_values row by name (language_id=1).
+            // Ensures the join table row for (options_id, values_id) exists.
+            // Returns the options_values_id.
+            $resolve_option_value = static function (string $name, int $options_id) use ($db): int {
+                // Find existing value by name, then verify it's linked to this option
+                $row = $db->Execute(
+                    "SELECT v.products_options_values_id"
+                    . " FROM " . TABLE_PRODUCTS_OPTIONS_VALUES . " v"
+                    . " INNER JOIN " . TABLE_PRODUCTS_OPTIONS_VALUES_TO_PRODUCTS_OPTIONS . " j"
+                    . "   ON j.products_options_values_id = v.products_options_values_id"
+                    . "   AND j.products_options_id = " . $options_id
+                    . " WHERE v.products_options_values_name = '" . zen_db_input($name) . "'"
+                    . "   AND v.language_id = 1 LIMIT 1"
+                );
+                if (!$row->EOF) return (int)$row->fields['products_options_values_id'];
+
+                // Create new value
+                $max    = $db->Execute("SELECT COALESCE(MAX(products_options_values_id),0) AS m FROM " . TABLE_PRODUCTS_OPTIONS_VALUES);
+                $new_id = (int)$max->fields['m'] + 1;
+                $langs  = $db->Execute("SELECT languages_id FROM " . TABLE_LANGUAGES);
+                while (!$langs->EOF) {
+                    $db->Execute(
+                        "INSERT IGNORE INTO " . TABLE_PRODUCTS_OPTIONS_VALUES
+                        . " (products_options_values_id, language_id, products_options_values_name)"
+                        . " VALUES (" . $new_id . ", " . (int)$langs->fields['languages_id']
+                        . ", '" . zen_db_input($name) . "')"
+                    );
+                    $langs->MoveNext();
+                }
+                // Link value to option
+                $db->Execute(
+                    "INSERT IGNORE INTO " . TABLE_PRODUCTS_OPTIONS_VALUES_TO_PRODUCTS_OPTIONS
+                    . " (products_options_id, products_options_values_id)"
+                    . " VALUES (" . $options_id . ", " . $new_id . ")"
+                );
+                return $new_id;
+            };
+
+            // Pass 1: resolve all option IDs and, per option, the deduplicated value IDs.
+            // We do this before touching products_attributes so we can delete-then-reinsert
+            // cleanly — avoiding the duplicate/wrong-option accumulation that upsert-then-prune
+            // suffers when the store already has rows under different option IDs.
+            $managed_options = []; // [ [options_id, sort_order, [[values_id, ...], ...]] ]
+            $opt_sort = 0;
+            foreach ($attr_options as $opt) {
+                $opt_name = trim((string)($opt['name'] ?? ''));
+                if ($opt_name === '') { $opt_sort++; continue; }
+                $options_id = $resolve_option($opt_name);
+
+                $seen_val_ids = [];
+                $value_ids    = [];
+                foreach ($opt['values'] ?? [] as $val) {
+                    $val_name = trim((string)($val['name'] ?? ''));
+                    if ($val_name === '') continue;
+                    $values_id = $resolve_option_value($val_name, $options_id);
+                    if (!isset($seen_val_ids[$values_id])) {
+                        $value_ids[]              = $values_id;
+                        $seen_val_ids[$values_id] = true;
+                    }
+                }
+
+                if (!empty($value_ids)) {
+                    $managed_options[] = [
+                        'options_id' => $options_id,
+                        'sort_order' => (int)($opt['sortOrder'] ?? $opt_sort),
+                        'value_ids'  => $value_ids,
+                    ];
+                }
+                $opt_sort++;
+            }
+
+            // Pass 2: delete all existing products_attributes rows for our managed options,
+            // then reinsert from scratch. This is idempotent and prevents stale rows from
+            // accumulating across uploads.
+            foreach ($managed_options as $mo) {
+                $db->Execute(
+                    "DELETE FROM " . TABLE_PRODUCTS_ATTRIBUTES
+                    . " WHERE products_id = " . $prod_id
+                    . "   AND options_id = "  . $mo['options_id']
+                );
+                foreach ($mo['value_ids'] as $values_id) {
+                    $db->Execute(
+                        "INSERT INTO " . TABLE_PRODUCTS_ATTRIBUTES
+                        . " (products_id, options_id, options_values_id,"
+                        . "  options_values_price, price_prefix, products_options_sort_order)"
+                        . " VALUES (" . $prod_id . ", " . $mo['options_id'] . ", " . $values_id
+                        . ", 0.0000, '', " . $mo['sort_order'] . ")"
+                    );
+                }
+            }
+
+            // ── POSM per-variant stock (dormant on vanilla ZenCart) ────────────
+            // Activated automatically when the products_options_stock table exists.
+            // pos_hash reproduces generate_pos_option_hash(): md5(products_id . sorted(options_id . values_id))
+            if ($posm_available && !empty($attr_variants)) {
+                // Build a map: variant sku => pos_id (for update vs insert)
+                $existing_pos = [];
+                $pos_rows = $db->Execute(
+                    "SELECT pos_id, pos_model FROM " . TABLE_PRODUCTS_OPTIONS_STOCK
+                    . " WHERE products_id = " . $prod_id
+                );
+                while (!$pos_rows->EOF) {
+                    $existing_pos[(string)$pos_rows->fields['pos_model']] = (int)$pos_rows->fields['pos_id'];
+                    $pos_rows->MoveNext();
+                }
+
+                $seen_pos_ids = [];
+                foreach ($attr_variants as $variant) {
+                    $v_sku = trim((string)($variant['sku'] ?? ''));
+                    $v_qty = (float)($variant['quantity'] ?? 0);
+                    if ($v_sku === '') continue;
+
+                    // Resolve each option name → (options_id, values_id) for this variant
+                    $combo = []; // [options_id => values_id]
+                    foreach ($variant['options'] ?? [] as $vo) {
+                        $vo_name = trim((string)($vo['name']  ?? ''));
+                        $vo_val  = trim((string)($vo['value'] ?? ''));
+                        if ($vo_name === '' || $vo_val === '') continue;
+                        $oid = $resolve_option($vo_name);
+                        $vid = $resolve_option_value($vo_val, $oid);
+                        $combo[$oid] = $vid;
+                    }
+                    if (empty($combo)) continue;
+
+                    // Compute pos_hash
+                    ksort($combo);
+                    $hash_in = (string)(int)$prod_id;
+                    foreach ($combo as $oid => $vid) {
+                        $hash_in .= (string)$oid . (string)$vid;
+                    }
+                    $pos_hash = md5($hash_in);
+
+                    if (isset($existing_pos[$v_sku])) {
+                        $pos_id = $existing_pos[$v_sku];
+                        $db->Execute(
+                            "UPDATE " . TABLE_PRODUCTS_OPTIONS_STOCK
+                            . " SET products_quantity = " . $v_qty
+                            . ", pos_hash = '" . $pos_hash . "'"
+                            . ", last_modified = NOW()"
+                            . " WHERE pos_id = " . $pos_id
+                        );
+                    } else {
+                        $db->Execute(
+                            "INSERT INTO " . TABLE_PRODUCTS_OPTIONS_STOCK
+                            . " (products_id, pos_name_id, products_quantity, pos_hash, pos_model, pos_date, last_modified)"
+                            . " VALUES (" . $prod_id . ", 1, " . $v_qty
+                            . ", '" . $pos_hash . "', '" . zen_db_input($v_sku) . "'"
+                            . ", NOW(), NOW())"
+                        );
+                        $pos_id = (int)zen_db_insert_id();
+                        // Link attributes
+                        foreach ($combo as $oid => $vid) {
+                            $db->Execute(
+                                "INSERT IGNORE INTO " . TABLE_PRODUCTS_OPTIONS_STOCK_ATTRIBUTES
+                                . " (pos_id, products_id, options_id, options_values_id)"
+                                . " VALUES (" . $pos_id . ", " . $prod_id . ", " . $oid . ", " . $vid . ")"
+                            );
+                        }
+                    }
+                    $seen_pos_ids[$pos_id] = true;
+                }
+
+                // Remove POSM rows for variants no longer sent
+                foreach ($existing_pos as $e_sku => $e_pos_id) {
+                    if (!isset($seen_pos_ids[$e_pos_id])) {
+                        $db->Execute(
+                            "DELETE FROM " . TABLE_PRODUCTS_OPTIONS_STOCK_ATTRIBUTES
+                            . " WHERE pos_id = " . $e_pos_id
+                        );
+                        $db->Execute(
+                            "DELETE FROM " . TABLE_PRODUCTS_OPTIONS_STOCK
+                            . " WHERE pos_id = " . $e_pos_id
+                        );
+                    }
                 }
             }
         }
