@@ -1,0 +1,31 @@
+<?php
+/**
+ * Example freebooks-zencart.php customisation hook.
+ *
+ * To use: copy this file to includes/erp_hooks/10-sku-prefix.php in
+ * your Zen Cart install and edit the prefix below to match your store. See
+ * README.md's "Customisation hooks" section for the full hook reference.
+ *
+ * This file uses a fictitious 'ACME-' prefix — it is generic documentation,
+ * not a real store's configuration.
+ */
+
+if (!defined('ZC_HOOKS')) exit;
+
+// This store's Zen Cart products_model values carry an 'ACME-' prefix that
+// the matching ERP SKUs do not. Strip it going out to the ERP (order
+// import), restore it coming back in (product/quantity upload).
+zc_add_filter('sku.export', function ($sku) {
+    return preg_replace('/^ACME-/', '', (string)$sku);
+});
+
+zc_add_filter('sku.import', function ($sku) {
+    $sku = (string)$sku;
+    return strpos($sku, 'ACME-') === 0 ? $sku : 'ACME-' . $sku;
+});
+
+// Example: hold back a buffer of stock on one SKU, whichever route the
+// quantity arrives by (updateProducts, updateProductsQty, or a POSM variant).
+zc_add_filter('quantity.import', function ($qty, array $ctx) {
+    return $ctx['sku'] === 'ACME-12345' ? max(0.0, $qty - 5) : $qty;
+});

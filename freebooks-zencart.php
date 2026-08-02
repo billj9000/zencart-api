@@ -36,14 +36,14 @@ require('includes/application_top.php');
 header('Content-Type: application/json');
 header('X-Content-Type-Options: nosniff');
 
-define('FB_API_VERSION', 3);
-define('FB_DEFAULT_TAX_CLASS_ID', 1);
+define('ZC_API_VERSION', 4);
+define('ZC_DEFAULT_TAX_CLASS_ID', 1);
 
 // ─── Response helpers ────────────────────────────────────────────────────────
 
 function api_ok($data = null): void
 {
-    $body = ['version' => FB_API_VERSION, 'ok' => true];
+    $body = ['version' => ZC_API_VERSION, 'ok' => true];
     if ($data !== null) {
         $body['data'] = $data;
     }
@@ -54,8 +54,99 @@ function api_ok($data = null): void
 function api_error(string $message, int $http_status = 400): void
 {
     http_response_code($http_status);
-    echo json_encode(['version' => FB_API_VERSION, 'ok' => false, 'error' => $message]);
+    echo json_encode(['version' => ZC_API_VERSION, 'ok' => false, 'error' => $message]);
     exit;
+}
+
+// ─── Customisation hooks ───────────────────────────────────────────────────────
+//
+// A store-specific quirk (e.g. a SKU prefix, a stock buffer on one product)
+// belongs in a per-store hook file, not in this shared file. Drop PHP files into
+// ZC_HOOK_DIR; each registers callbacks via zc_add_filter()/zc_add_action(), and
+// this file calls zc_filter()/zc_do_action() at documented points (see README.md
+// for the full list) — several hooks can share one point, and a broken hook
+// can't take down the whole response.
+//
+// ZC_HOOK_DIR may be predefined (e.g. from includes/extra_configures/) to move
+// the directory; otherwise it defaults below.
+if (!defined('ZC_HOOK_DIR')) {
+    define('ZC_HOOK_DIR', DIR_FS_CATALOG . 'includes/erp_hooks/');
+}
+define('ZC_HOOKS', true); // guard constant hook files check for, in case a server has no .htaccess support
+
+$GLOBALS['zc_hooks'] = ['filters' => [], 'actions' => []];
+
+function zc_add_filter(string $name, callable $fn, int $priority = 10): void
+{
+    $GLOBALS['zc_hooks']['filters'][$name][$priority][] = $fn;
+}
+
+function zc_add_action(string $name, callable $fn, int $priority = 10): void
+{
+    $GLOBALS['zc_hooks']['actions'][$name][$priority][] = $fn;
+}
+
+function zc_has_hook(string $name): bool
+{
+    return !empty($GLOBALS['zc_hooks']['filters'][$name]) || !empty($GLOBALS['zc_hooks']['actions'][$name]);
+}
+
+// Shared runner for both zc_filter() and zc_do_action(). $is_filter controls
+// whether a callback's return value is kept and chained into the next callback.
+function _zc_run(string $name, $value, array $ctx, bool $is_filter)
+{
+    $bucket = $is_filter ? 'filters' : 'actions';
+    $queue  = $GLOBALS['zc_hooks'][$bucket][$name] ?? [];
+    if (empty($queue)) {
+        return $value;
+    }
+    ksort($queue); // lower priority number runs first
+
+    foreach ($queue as $callbacks) {
+        foreach ($callbacks as $fn) {
+            try {
+                $result = $fn($value, $ctx);
+            } catch (\Throwable $e) {
+                api_error('Hook "' . $name . '" failed: ' . $e->getMessage(), 500);
+            }
+            if ($is_filter) {
+                if ($result === null) {
+                    // Forgetting `return` in a filter is the commonest hook bug —
+                    // keep the previous value rather than silently blanking it.
+                    error_log('freebooks-zencart.php: filter "' . $name . '" returned null; ignoring and keeping previous value');
+                } else {
+                    $value = $result;
+                }
+            }
+        }
+    }
+    return $value;
+}
+
+function zc_filter(string $name, $value, array $ctx = [])
+{
+    return _zc_run($name, $value, $ctx, true);
+}
+
+function zc_do_action(string $name, array $ctx = []): void
+{
+    _zc_run($name, null, $ctx, false);
+}
+
+function zc_load_hooks(): void
+{
+    global $db;
+    if (!is_dir(ZC_HOOK_DIR)) {
+        return;
+    }
+    $files = glob(rtrim(ZC_HOOK_DIR, '/') . '/*.php');
+    if ($files === false) {
+        return;
+    }
+    sort($files); // filename order, e.g. "10-sku-prefix.php" before "20-stock-buffer.php"
+    foreach ($files as $file) {
+        include_once $file;
+    }
 }
 
 // ─── Authentication ───────────────────────────────────────────────────────────
@@ -90,7 +181,7 @@ function check_access($db): void
 // ZenCart 1.5.x signature: zen_update_orders_history($oID, $message, $updated_by, $status, $notify, $notify_comments)
 // ZenCart 2.x retains the same function name; $updated_by moved to a later parameter in some builds.
 // We prefer the native function; if absent (stripped installs) we insert directly.
-function fb_update_order_history($db, int $order_id, string $comment, int $status, int $notify, string $updated_by = 'FreeBooks'): int
+function zc_update_order_history($db, int $order_id, string $comment, int $status, int $notify, string $updated_by = 'FreeBooks'): int
 {
     if (function_exists('zen_update_orders_history')) {
         return (int) zen_update_orders_history($order_id, $comment, $updated_by, $status, $notify, true);
@@ -298,9 +389,9 @@ function get_orders($db, int $last_order): void
                 $opts_result->MoveNext();
             }
 
-            $items[] = [
+            $item = [
                 'productID' => (int)$prod_result->fields['products_id'],
-                'sku'       => $prod_result->fields['products_model'],
+                'sku'       => zc_filter('sku.export', $prod_result->fields['products_model'], ['order_id' => $order_id]),
                 'name'      => $prod_result->fields['products_name'] . $attr_str,
                 'image'     => HTTP_SERVER . DIR_WS_CATALOG . DIR_WS_IMAGES . $prod_result->fields['products_image'],
                 'weight'    => (float)$prod_result->fields['products_weight'],
@@ -309,6 +400,7 @@ function get_orders($db, int $last_order): void
                 'tax'       => $tax,
                 'options'   => $options,
             ];
+            $items[] = zc_filter('order.item', $item, ['order_id' => $order_id, 'fields' => $prod_result->fields]);
             $prod_result->MoveNext();
         }
 
@@ -369,6 +461,23 @@ function get_orders($db, int $last_order): void
                         ];
                     }
                     break;
+                default:
+                    // Seam for store-specific order-total line items (e.g. a
+                    // custom fee/discount module) without editing this file.
+                    // Return an item array shaped like the ones above to have
+                    // it appended; anything else (including the default null)
+                    // is ignored.
+                    $extra = zc_filter('order.total_line', null, [
+                        'class'    => $totals_result->fields['class'],
+                        'title'    => $title,
+                        'value'    => $raw,
+                        'vat_rate' => $ot_vat,
+                        'order'    => $order,
+                    ]);
+                    if (is_array($extra)) {
+                        $ot_extra['hook_' . count($ot_extra)] = $extra;
+                    }
+                    break;
             }
             $totals_result->MoveNext();
         }
@@ -376,6 +485,11 @@ function get_orders($db, int $last_order): void
         foreach (['coupon', 'taxamo_assure', 'dhl_landedcost', 'easproject_ioss'] as $key) {
             if (isset($ot_extra[$key])) {
                 $items[] = $ot_extra[$key];
+            }
+        }
+        foreach ($ot_extra as $key => $extra_item) {
+            if (strpos($key, 'hook_') === 0) {
+                $items[] = $extra_item;
             }
         }
 
@@ -388,17 +502,19 @@ function get_orders($db, int $last_order): void
         }
 
         $order['items'] = $items;
-        $orders[]       = $order;
+        $orders[]       = zc_filter('order', $order, ['row' => $result->fields]);
         $result->MoveNext();
     }
 
-    api_ok(['orders' => $orders]);
+    api_ok(zc_filter('orders.response', ['orders' => $orders]));
 }
 
 // ─── POST updateOrderComments ─────────────────────────────────────────────────
 
 function update_order_comments($db, array $data): void
 {
+    $data = zc_filter('order_comment.incoming', $data);
+
     $order_id = isset($data['orderId']) ? (int)$data['orderId'] : 0;
     $comment  = isset($data['comment']) ? trim((string)$data['comment']) : '';
     if (!$order_id || $comment === '') {
@@ -415,7 +531,7 @@ function update_order_comments($db, array $data): void
     $status     = isset($data['status']) ? (int)$data['status'] : 4;
     $updated_by = isset($data['updatedBy']) ? trim((string)$data['updatedBy']) : 'FreeBooks';
     if ($updated_by === '') $updated_by = 'FreeBooks';
-    $result = fb_update_order_history($db, $order_id, $comment, $status, 1, $updated_by);
+    $result = zc_update_order_history($db, $order_id, $comment, $status, 1, $updated_by);
     if ($result > 0) {
         api_ok(['message' => 'Order ' . $order_id . ' updated']);
     } else {
@@ -456,7 +572,9 @@ function update_products($db, array $data): void
     $not_updated = [];
 
     foreach ($products as $product) {
-        $sku = trim((string)($product['products_model'] ?? ''));
+        $product   = zc_filter('product.incoming', $product);
+        $source_sku = trim((string)($product['products_model'] ?? ''));
+        $sku        = zc_filter('sku.import', $source_sku);
         if ($sku === '') {
             $not_updated[] = '(empty SKU)';
             continue;
@@ -544,7 +662,7 @@ function update_products($db, array $data): void
         }
 
         // Build products table row
-        $tax_class_id = !empty($product['productTaxable']) ? FB_DEFAULT_TAX_CLASS_ID : 0;
+        $tax_class_id = !empty($product['productTaxable']) ? ZC_DEFAULT_TAX_CLASS_ID : 0;
         $prod_row = [
             'products_model'       => $sku,
             'products_type'        => $type_id,
@@ -554,7 +672,11 @@ function update_products($db, array $data): void
         if ($img_file !== '')
             $prod_row['products_image']          = $img_path;
         if (isset($product['quantity']))
-            $prod_row['products_quantity']        = max(0.0, (float)$product['quantity']);
+            $prod_row['products_quantity']        = zc_filter(
+                'quantity.import',
+                max(0.0, (float)$product['quantity']),
+                ['sku' => $sku, 'source_sku' => $source_sku, 'product' => $product, 'task' => 'updateProducts']
+            );
         if (isset($product['product_virtual']))
             $prod_row['products_virtual']         = (int)$product['product_virtual'];
         if (isset($product['dateUpdated']))
@@ -641,7 +763,18 @@ function update_products($db, array $data): void
             "SELECT products_id FROM " . TABLE_PRODUCTS
             . " WHERE products_model = '" . zen_db_input($sku) . "' LIMIT 1"
         );
-        if ($existing->EOF) {
+        $is_new = $existing->EOF;
+        $row_ctx = [
+            'product'     => $product,
+            'sku'         => $sku,
+            'lang_id'     => $lang_id,
+            'is_new'      => $is_new,
+            'products_id' => $is_new ? null : (int)$existing->fields['products_id'],
+        ];
+        $prod_row = zc_filter('product.row', $prod_row, $row_ctx);
+        $desc_row = zc_filter('product.desc_row', $desc_row, $row_ctx);
+
+        if ($is_new) {
             $prod_row['products_date_added'] = date('Y-m-d H:i:s');
             zen_db_perform(TABLE_PRODUCTS, $prod_row);
             $prod_id = (int)zen_db_insert_id();
@@ -661,6 +794,14 @@ function update_products($db, array $data): void
                 "products_id = " . $prod_id . " AND language_id = " . $lang_id);
             $updated[] = $sku;
         }
+
+        zc_do_action('product.saved', [
+            'products_id' => $prod_id,
+            'sku'         => $sku,
+            'product'     => $product,
+            'is_new'      => $is_new,
+            'lang_id'     => $lang_id,
+        ]);
 
         // Write quantity-tier discount rows. Always wipe and rewrite so stale tiers don't accumulate.
         if ($has_qty_discount_table) {
@@ -711,7 +852,13 @@ function update_products($db, array $data): void
                     . "   AND language_id = 1 LIMIT 1"
                 );
                 if (!$row->EOF) return (int)$row->fields['products_options_id'];
-                $max = $db->Execute("SELECT COALESCE(MAX(products_options_id),0) AS m FROM " . TABLE_PRODUCTS_OPTIONS);
+                // removeFromQueryCache=true: this exact query text repeats across
+                // options created within the same request, and ZenCart's queryFactory
+                // memoizes Execute() results by raw SQL — without this, the 2nd+ new
+                // option in one updateProducts call reads back the 1st call's stale
+                // MAX() and collides onto the same id (INSERT IGNORE then silently
+                // no-ops), losing the option entirely. Confirmed live.
+                $max = $db->Execute("SELECT COALESCE(MAX(products_options_id),0) AS m FROM " . TABLE_PRODUCTS_OPTIONS, null, false, 0, true);
                 $new_id = (int)$max->fields['m'] + 1;
                 $langs  = $db->Execute("SELECT languages_id FROM " . TABLE_LANGUAGES);
                 while (!$langs->EOF) {
@@ -742,8 +889,9 @@ function update_products($db, array $data): void
                 );
                 if (!$row->EOF) return (int)$row->fields['products_options_values_id'];
 
-                // Create new value
-                $max    = $db->Execute("SELECT COALESCE(MAX(products_options_values_id),0) AS m FROM " . TABLE_PRODUCTS_OPTIONS_VALUES);
+                // Create new value. removeFromQueryCache=true — see the matching
+                // comment in $resolve_option above; same collision, same fix.
+                $max    = $db->Execute("SELECT COALESCE(MAX(products_options_values_id),0) AS m FROM " . TABLE_PRODUCTS_OPTIONS_VALUES, null, false, 0, true);
                 $new_id = (int)$max->fields['m'] + 1;
                 $langs  = $db->Execute("SELECT languages_id FROM " . TABLE_LANGUAGES);
                 while (!$langs->EOF) {
@@ -834,8 +982,13 @@ function update_products($db, array $data): void
 
                 $seen_pos_ids = [];
                 foreach ($attr_variants as $variant) {
-                    $v_sku = trim((string)($variant['sku'] ?? ''));
-                    $v_qty = (float)($variant['quantity'] ?? 0);
+                    $v_source_sku = trim((string)($variant['sku'] ?? ''));
+                    $v_sku = zc_filter('sku.import', $v_source_sku);
+                    $v_qty = zc_filter(
+                        'quantity.import',
+                        (float)($variant['quantity'] ?? 0),
+                        ['sku' => $v_sku, 'source_sku' => $v_source_sku, 'product' => $variant, 'task' => 'updateProducts']
+                    );
                     if ($v_sku === '') continue;
 
                     // Resolve each option name → (options_id, values_id) for this variant
@@ -905,7 +1058,7 @@ function update_products($db, array $data): void
         }
     }
 
-    api_ok(['added' => $added, 'updated' => $updated, 'notUpdated' => $not_updated]);
+    api_ok(zc_filter('products.response', ['added' => $added, 'updated' => $updated, 'notUpdated' => $not_updated]));
 }
 
 // ─── POST updateProductsQty ───────────────────────────────────────────────────
@@ -917,7 +1070,9 @@ function update_products_qty($db, array $data): void
     $not_updated = [];
 
     foreach ($products as $product) {
-        $sku = trim((string)($product['products_model'] ?? ''));
+        $product    = zc_filter('product_qty.incoming', $product);
+        $source_sku = trim((string)($product['products_model'] ?? ''));
+        $sku        = zc_filter('sku.import', $source_sku);
         if ($sku === '') {
             $not_updated[] = '(empty SKU)';
             continue;
@@ -925,12 +1080,19 @@ function update_products_qty($db, array $data): void
 
         $row = [];
         if (isset($product['quantity'])) {
-            $row['products_quantity'] = max(0.0, (float)$product['quantity']);
+            $row['products_quantity'] = zc_filter(
+                'quantity.import',
+                max(0.0, (float)$product['quantity']),
+                ['sku' => $sku, 'source_sku' => $source_sku, 'product' => $product, 'task' => 'updateProductsQty']
+            );
         }
         if (isset($product['price'])) {
             $row['products_price'] = (float)$product['price'];
         }
-        if (empty($row)) {
+        if (empty($row) && !zc_has_hook('product_qty.row')) {
+            // Nothing to write and no hook registered to possibly add
+            // something — skip the lookup below entirely, as before hooks
+            // existed.
             $not_updated[] = $sku;
             continue;
         }
@@ -943,21 +1105,45 @@ function update_products_qty($db, array $data): void
             $not_updated[] = $sku;
             continue;
         }
-        zen_db_perform(TABLE_PRODUCTS, $row, 'update', "products_id = " . (int)$existing->fields['products_id']);
+        $products_id = (int)$existing->fields['products_id'];
+
+        $row = zc_filter('product_qty.row', $row, [
+            'sku'         => $sku,
+            'source_sku'  => $source_sku,
+            'products_id' => $products_id,
+            'product'     => $product,
+        ]);
+        if (empty($row)) {
+            $not_updated[] = $sku;
+            continue;
+        }
+
+        zen_db_perform(TABLE_PRODUCTS, $row, 'update', "products_id = " . $products_id);
         $updated[] = $sku;
     }
 
-    api_ok(['updated' => $updated, 'notUpdated' => $not_updated]);
+    api_ok(zc_filter('products_qty.response', ['updated' => $updated, 'notUpdated' => $not_updated]));
 }
 
 // ─── Router ───────────────────────────────────────────────────────────────────
 
 check_access($db);
+zc_load_hooks();
 
 $task = (string)($_REQUEST['task'] ?? '');
 
+zc_do_action('boot', ['task' => $task]);
+
 if ($task === 'version') {
-    api_ok(['apiVersion' => FB_API_VERSION, 'file' => 'freebooks-zencart.php']);
+    api_ok([
+        'apiVersion' => ZC_API_VERSION,
+        'file'       => 'freebooks-zencart.php',
+        'hookDir'    => ZC_HOOK_DIR,
+        'hooks'      => array_values(array_unique(array_merge(
+            array_keys($GLOBALS['zc_hooks']['filters']),
+            array_keys($GLOBALS['zc_hooks']['actions'])
+        ))),
+    ]);
 } elseif ($task === 'orders') {
     $last_order = isset($_REQUEST['last_order']) ? (int)$_REQUEST['last_order'] : -1;
     get_orders($db, $last_order);
@@ -974,6 +1160,18 @@ if ($task === 'version') {
     } else {
         update_products_qty($db, $data);
     }
+} elseif ($task !== '' && zc_has_hook('task.' . $task)) {
+    // Lets a store add a wholly custom endpoint (registered in a hook file)
+    // without touching this shared file. The hook is responsible for calling
+    // api_ok()/api_error() itself, same as any built-in task handler.
+    $json = (string)file_get_contents('php://input');
+    $body = json_decode($json, true);
+    zc_do_action('task.' . $task, [
+        'task'    => $task,
+        'request' => $_REQUEST,
+        'body'    => is_array($body) ? $body : null,
+    ]);
+    api_error('Custom task "' . $task . '" did not send a response', 500);
 } else {
     api_error('Unknown task: ' . $task, 404);
 }
