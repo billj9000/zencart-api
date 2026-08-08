@@ -543,13 +543,28 @@ function updateProduct($db = null, $data)
         if( !is_string($image_directory) )
             $image_directory = '';
 
-        // directory must not be more than one level down
+        // directory must not be more than one level down, and must not
+        // traverse upward — it feeds a path under images/.
         if (strpos($image_directory, '/') !== false) {
         $image_directory = substr($image_directory, 0, strpos($image_directory, '/'));
+        }
+        $image_directory = basename($image_directory);
+        if ($image_directory === '.' || $image_directory === '..') {
+            $image_directory = '';
         }
         $image_filename = $product['productImageFileName'];
         if( $image_filename == null )
             $image_filename = '';
+        // The filename also feeds a path under images/, so strip any directory
+        // component and reject non-image extensions — an unsanitised ".php"
+        // name here would be an arbitrary-write / RCE vector. SVG is excluded
+        // on purpose: it can carry inline script and would run in the store's origin.
+        $image_filename = basename($image_filename);
+        if ($image_filename !== '' && !preg_match('/^[^\/\\\\]+\.(jpe?g|png|gif|webp|bmp|tiff?)$/i', $image_filename)) {
+            $out = array('message' => 'Illegal image filename: ' . $image_filename, "status" => 1);
+            echo json_encode($out);
+            return;
+        }
 
         // Save the image
         $image_data = $product['productImageData'];

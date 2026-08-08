@@ -634,13 +634,22 @@ function update_products($db, array $data): void
             api_error('Category is not a leaf node: ' . $cat_name . ' (' . $sku . ')');
         }
 
-        // Image — sanitise directory to prevent path traversal
+        // Image — sanitise directory and filename to prevent path traversal.
+        // Both feed a path under images/, so a traversal sequence ("../") or a
+        // non-image extension (".php") here would be an arbitrary-write / RCE
+        // vector. basename() strips any directory component, and the extension
+        // allowlist blocks executable/SVG payloads. SVG is excluded on purpose:
+        // it can carry inline script and would run in the store's origin.
         $img_dir  = '';
-        $img_file = (string)($product['productImageFileName'] ?? '');
+        $img_file = basename((string)($product['productImageFileName'] ?? ''));
+        if ($img_file !== '' && !preg_match('/^[^\/\\\\]+\.(jpe?g|png|gif|webp|bmp|tiff?)$/i', $img_file)) {
+            api_error('Illegal image filename: ' . $img_file);
+        }
         $img_path = $img_file;
         if (!empty($product['productImageDirectory']) && is_string($product['productImageDirectory'])) {
-            $img_dir  = preg_replace('/[\/\\\\].*/', '', $product['productImageDirectory']);
-            $img_path = $img_dir . '/' . $img_file;
+            $img_dir = basename(preg_replace('/[\/\\\\].*/', '', $product['productImageDirectory']));
+            if ($img_dir === '.' || $img_dir === '..') $img_dir = '';
+            if ($img_dir !== '') $img_path = $img_dir . '/' . $img_file;
         }
         if (!empty($product['productImageData'])) {
             $contents = base64_decode(str_replace(['-', '_'], ['+', '/'], $product['productImageData']));
