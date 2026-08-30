@@ -353,6 +353,92 @@ function get_payment_ref($db, int $order_id, string $module): string
     return '';
 }
 
+// ─── Country code lookup ─────────────────────────────────────────────────────
+
+/**
+ * ISO 3166-1 alpha-2 code for a country name stored on an order.
+ *
+ * The orders table has never carried a delivery_country_code or
+ * billing_country_code column in any Zen Cart release. It stores
+ * delivery_country and billing_country as plain names -- varchar(64), captured
+ * at the time of the order -- and there is no country id to go with them.
+ *
+ * This export read those two non-existent columns directly, so every order
+ * FreeBooks has ever received carried a null countryCode, and each one logged
+ * a PHP warning on the way out. Resolving from the stored name is the only
+ * route available after the fact.
+ *
+ * Results are memoized for the request. An export of several thousand orders
+ * otherwise repeats the same handful of lookups thousands of times, and this
+ * runs inside the loop that already had to be taught not to exhaust memory.
+ */
+function zc_country_code($db, $country_name): string
+{
+    static $cache = [];
+
+    $name = trim((string)$country_name);
+    if ($name === '') {
+        return '';
+    }
+    if (isset($cache[$name])) {
+        return $cache[$name];
+    }
+
+    $r = $db->Execute(
+        "SELECT countries_iso_code_2 FROM " . TABLE_COUNTRIES
+        . " WHERE countries_name = '" . zen_db_input($name) . "' LIMIT 1"
+    );
+    $code = $r->EOF ? '' : (string)($r->fields['countries_iso_code_2'] ?? '');
+
+    if ($code === '') {
+        // Zen Cart has renamed countries in its own shipped data over the
+        // years, so an order taken before a rename holds a name the countries
+        // table no longer contains and the join above finds nothing. These are
+        // Zen Cart's former names, not one store's data entry, which is why
+        // they belong here rather than in a store's hook file.
+        //
+        // Add to this list rather than editing historical orders: the name on
+        // an order is a record of what the customer was shown at the time.
+        static $renamed = [
+            'Slovakia (Slovak Republic)' => 'SK',   // now 'Slovakia'
+            'Turkey'                     => 'TR',   // now 'Türkiye'
+        ];
+        $code = $renamed[$name] ?? '';
+    }
+
+    $cache[$name] = $code;
+
+    return $code;
+}
+
+/**
+ * Read a country code off an order row.
+ *
+ * Prefers a real column where the install has one -- some address mods add
+ * delivery_country_code / billing_country_code -- and falls back to resolving
+ * the stored country name. The column check is one SHOW COLUMNS per request,
+ * not per order.
+ *
+ * @param string $prefix 'delivery' or 'billing'
+ */
+function zc_order_country_code($db, array $fields, string $prefix): string
+{
+    static $has_column = [];
+
+    if (!isset($has_column[$prefix])) {
+        $col = $db->Execute(
+            "SHOW COLUMNS FROM " . TABLE_ORDERS . " LIKE '" . zen_db_input($prefix) . "_country_code'"
+        );
+        $has_column[$prefix] = !$col->EOF;
+    }
+
+    if ($has_column[$prefix] && !empty($fields[$prefix . '_country_code'])) {
+        return (string)$fields[$prefix . '_country_code'];
+    }
+
+    return zc_country_code($db, $fields[$prefix . '_country'] ?? '');
+}
+
 // ─── GET orders ──────────────────────────────────────────────────────────────
 
 function get_orders($db, int $last_order): void
@@ -429,7 +515,7 @@ function get_orders($db, int $last_order): void
                 'postalCode' => $result->fields['billing_postcode'],
                 'state'       => $result->fields['billing_state'],
                 'country'     => $result->fields['billing_country'],
-                'countryCode' => $result->fields['billing_country_code'],
+                'countryCode' => zc_order_country_code($db, $result->fields, 'billing'),
             ],
             'shippingAddress' => [
                 'name'        => $result->fields['delivery_name'],
@@ -440,7 +526,7 @@ function get_orders($db, int $last_order): void
                 'postalCode'  => $result->fields['delivery_postcode'],
                 'state'       => $result->fields['delivery_state'],
                 'country'     => $result->fields['delivery_country'],
-                'countryCode' => $result->fields['delivery_country_code'],
+                'countryCode' => zc_order_country_code($db, $result->fields, 'delivery'),
             ],
         ];
 
