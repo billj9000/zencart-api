@@ -58,6 +58,95 @@ function api_error(string $message, int $http_status = 400): void
     exit;
 }
 
+// ─── Bulk-request memory management ──────────────────────────────────────────
+//
+// Zen Cart memoizes every SELECT of a request in QueryCache, keyed by the SQL
+// string, and never evicts. That is right for a page render, which issues a
+// bounded set of distinct queries and reuses them. It is wrong for these
+// endpoints, which loop over a payload and issue at least one *distinct* SELECT
+// per item: the key is different every time, so nothing is ever reused and the
+// cache grows in proportion to the size of the request.
+//
+// Measured on this store, updateProductsQty retained 32 KB per product -- two
+// buffered mysqli_result sets at 16 KB each -- growing dead linearly. A 128 MB
+// memory_limit was therefore exhausted at ~3,700 products, and the hourly
+// full-catalogue sync died every time with
+//
+//   PHP Fatal error: Allowed memory size of 134217728 bytes exhausted
+//   (tried to allocate 16384 bytes) in .../db/mysql/query_factory.php on line 448
+//
+// (16384 being exactly one more result buffer.) Flushing on a fixed interval
+// makes the footprint flat rather than linear. It costs no extra queries,
+// because each item is visited once and so no cache entry is ever read back --
+// the cache was pure overhead on this path. Zen Cart core does the same thing
+// for the same reason in modules/pages/sitemapxml/sitemapxml_products.php.
+//
+// Flushing is safe mid-iteration over an outer result set: queryFactoryResult
+// keeps its own reference to the mysqli_result in ->resource, so dropping the
+// cache's reference does not free a result that is still being walked.
+//
+// Sized to bound the cache at a few MB while keeping the call rare enough to be
+// free; the exact value is not sensitive.
+if (!defined('ZC_QUERY_CACHE_FLUSH_EVERY')) {
+    define('ZC_QUERY_CACHE_FLUSH_EVERY', 250);
+}
+
+/**
+ * Read and decode the JSON request body, then release the raw string.
+ *
+ * Returns the decoded array, or null if the body was absent or did not decode
+ * to an array; callers decide whether that is fatal.
+ */
+function zc_read_json_body(): ?array
+{
+    $json = (string)file_get_contents('php://input');
+
+    // A POST larger than post_max_size is discarded by PHP *before* this script
+    // runs: the input stream reads back empty while Content-Length still reports
+    // the real size. Left undetected that surfaces as a generic "not valid JSON",
+    // which sends the caller hunting for a syntax error that isn't there. Name
+    // the actual limit instead.
+    $declared = (int)($_SERVER['CONTENT_LENGTH'] ?? 0);
+    if ($json === '' && $declared > 0) {
+        api_error(sprintf(
+            'Request body of %d bytes was discarded by PHP before it reached this script: '
+            . 'it exceeds post_max_size (%s). Send the payload in smaller batches.',
+            $declared,
+            ini_get('post_max_size')
+        ), 413);
+    }
+
+    $data = json_decode($json, true);
+
+    // The raw body is the same order of size as the decoded payload -- megabytes
+    // on a full-catalogue sync -- and is dead weight from here on. json_decode's
+    // error state is global, so callers can still read json_last_error_msg().
+    unset($json);
+
+    return is_array($data) ? $data : null;
+}
+
+/**
+ * Flush Zen Cart's SELECT memoization cache every ZC_QUERY_CACHE_FLUSH_EVERY
+ * items. Call once per outer-loop iteration, passing a 1-based counter.
+ *
+ * Call it at the TOP of the loop body: these loops `continue` on several paths,
+ * and a call at the bottom would be skipped exactly on the cheap iterations
+ * that a large payload has most of.
+ */
+function zc_periodic_flush(int $iteration): void
+{
+    if ($iteration % ZC_QUERY_CACHE_FLUSH_EVERY !== 0) {
+        return;
+    }
+    global $queryCache;
+    // Probed rather than assumed -- this file supports ZC 1.5.8 through 2.x and
+    // the global is not guaranteed to be present. Same probe core uses.
+    if (isset($queryCache) && is_object($queryCache) && method_exists($queryCache, 'reset')) {
+        $queryCache->reset('ALL');
+    }
+}
+
 // ─── Customisation hooks ───────────────────────────────────────────────────────
 //
 // A store-specific quirk (e.g. a SKU prefix, a stock buffer on one product)
@@ -270,7 +359,9 @@ function get_orders($db, int $last_order): void
     );
 
     $orders = [];
+    $n = 0;
     while (!$result->EOF) {
+        zc_periodic_flush(++$n);
         $order_id = (int)$result->fields['orders_id'];
 
         // Status name
@@ -571,7 +662,9 @@ function update_products($db, array $data): void
     $updated     = [];
     $not_updated = [];
 
+    $n = 0;
     foreach ($products as $product) {
+        zc_periodic_flush(++$n);
         $product   = zc_filter('product.incoming', $product);
         $source_sku = trim((string)($product['products_model'] ?? ''));
         $sku        = zc_filter('sku.import', $source_sku);
@@ -1078,7 +1171,9 @@ function update_products_qty($db, array $data): void
     $updated     = [];
     $not_updated = [];
 
+    $n = 0;
     foreach ($products as $product) {
+        zc_periodic_flush(++$n);
         $product    = zc_filter('product_qty.incoming', $product);
         $source_sku = trim((string)($product['products_model'] ?? ''));
         $sku        = zc_filter('sku.import', $source_sku);
@@ -1157,10 +1252,9 @@ if ($task === 'version') {
     $last_order = isset($_REQUEST['last_order']) ? (int)$_REQUEST['last_order'] : -1;
     get_orders($db, $last_order);
 } elseif (in_array($task, ['updateOrderComments', 'updateProducts', 'updateProductsQty'], true)) {
-    $json = (string)file_get_contents('php://input');
-    $data = json_decode($json, true);
-    if (!is_array($data)) {
-        api_error('Request body must be valid JSON');
+    $data = zc_read_json_body();
+    if ($data === null) {
+        api_error('Request body must be valid JSON: ' . json_last_error_msg());
     }
     if ($task === 'updateOrderComments') {
         update_order_comments($db, $data);
@@ -1173,12 +1267,10 @@ if ($task === 'version') {
     // Lets a store add a wholly custom endpoint (registered in a hook file)
     // without touching this shared file. The hook is responsible for calling
     // api_ok()/api_error() itself, same as any built-in task handler.
-    $json = (string)file_get_contents('php://input');
-    $body = json_decode($json, true);
     zc_do_action('task.' . $task, [
         'task'    => $task,
         'request' => $_REQUEST,
-        'body'    => is_array($body) ? $body : null,
+        'body'    => zc_read_json_body(),
     ]);
     api_error('Custom task "' . $task . '" did not send a response', 500);
 } else {
