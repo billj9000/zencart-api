@@ -301,8 +301,15 @@ function zc_update_order_history($db, int $order_id, string $comment, int $statu
 // works identically across ZenCart versions.
 function get_payment_ref($db, int $order_id, string $module): string
 {
+    // These tables outlive their payment modules. Historical orders still
+    // reference Square and Braintree transactions long after the modules are
+    // uninstalled, so define the table names here rather than relying on the
+    // modules' own datafiles being present.
     if (!defined('TABLE_SQUARE_PAYMENTS')) {
         define('TABLE_SQUARE_PAYMENTS', DB_PREFIX . 'square_payments');
+    }
+    if (!defined('TABLE_BRAINTREE')) {
+        define('TABLE_BRAINTREE', DB_PREFIX . 'braintree');
     }
 
     switch ($module) {
@@ -647,6 +654,18 @@ function update_products($db, array $data): void
     $has_products_condition     = $col('products_condition');
     $has_products_dim_type      = $col('products_dim_type');
     $has_ships_in_own_box       = $col('product_ships_in_own_box');
+    // Two names for one field. Zen Cart 2.0.0 adopted Numinix's New Product
+    // Fields column into core and renamed it:
+    //
+    //   mysql_upgrade_zencart_200.sql:161
+    //   ALTER TABLE products CHANGE products_ready_to_ship
+    //                               product_ships_in_own_box TINYINT DEFAULT NULL;
+    //
+    // Neither name is in 1.5.8a core -- the old one exists only where NPF was
+    // installed. So the pair below is a version fallback, not redundancy: 2.x
+    // core name first, 1.5.8a + NPF name second. On a 2.x store the second
+    // branch is unreachable, which is exactly why it is easy to mistake for
+    // dead code and "simplify" away. Do not.
     $has_ready_to_ship          = $col('products_ready_to_ship');
     $has_hs_code                = $col('hs_code');
     $has_country_of_origin      = $col('country_of_origin');
