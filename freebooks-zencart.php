@@ -391,17 +391,49 @@ function zc_country_code($db, $country_name): string
     $code = $r->EOF ? '' : (string)($r->fields['countries_iso_code_2'] ?? '');
 
     if ($code === '') {
-        // Zen Cart has renamed countries in its own shipped data over the
-        // years, so an order taken before a rename holds a name the countries
-        // table no longer contains and the join above finds nothing. These are
-        // Zen Cart's former names, not one store's data entry, which is why
-        // they belong here rather than in a store's hook file.
+        // Country names change, and an order taken before a rename holds a
+        // name the countries table no longer contains, so the lookup above
+        // finds nothing. Two things feed this list: names Zen Cart itself has
+        // replaced in its shipped data over the years, and names a store has
+        // replaced by bringing its countries table into line with ISO 3166-1.
+        // Either way these are Zen Cart's former names rather than one store's
+        // data entry, which is why they belong here rather than in a store's
+        // hook file.
         //
         // Add to this list rather than editing historical orders: the name on
         // an order is a record of what the customer was shown at the time.
+        //
+        // Ordering matters and is deliberate. The countries table is consulted
+        // FIRST, above, so a name that is still current always wins and an
+        // entry here only takes effect once that name has genuinely stopped
+        // being current. That is what makes it safe to list names an install
+        // may not have renamed -- or may never rename.
         static $renamed = [
-            'Slovakia (Slovak Republic)' => 'SK',   // now 'Slovakia'
-            'Turkey'                     => 'TR',   // now 'Türkiye'
+            // Replaced in Zen Cart's own shipped data
+            'Slovakia (Slovak Republic)'                 => 'SK',
+            'Turkey'                                     => 'TR',
+            // Countries that were renamed
+            'Cape Verde'                                 => 'CV',
+            'Czech Republic'                             => 'CZ',
+            'Swaziland'                                  => 'SZ',
+            'Macedonia, The Former Yugoslav Republic of' => 'MK',
+            // Corrected spelling, capitalisation and abbreviation
+            'Bosnia and Herzegowina'                     => 'BA',
+            'Guinea-bissau'                              => 'GW',
+            'Heard and Mc Donald Islands'                => 'HM',
+            'St. Pierre and Miquelon'                    => 'PM',
+            'St. Helena'                                 => 'SH',
+            'Svalbard and Jan Mayen Islands'             => 'SJ',
+            'Virgin Islands (British)'                   => 'VG',
+            'Virgin Islands (U.S.)'                      => 'VI',
+            'Wallis and Futuna Islands'                  => 'WF',
+            // Superseded by ISO's formal long form
+            'Bolivia'                                    => 'BO',
+            'Iran (Islamic Republic of)'                 => 'IR',
+            'Moldova'                                    => 'MD',
+            'Taiwan'                                     => 'TW',
+            'Vatican City State (Holy See)'              => 'VA',
+            'Venezuela'                                  => 'VE',
         ];
         $code = $renamed[$name] ?? '';
     }
