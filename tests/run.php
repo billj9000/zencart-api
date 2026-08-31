@@ -121,6 +121,85 @@ T::is('a missing country field is not fatal', zc_order_country_code($db4, [], 'd
 
 
 // ===========================================================================
+T::group('zc_default_language_id -- which language names are read in');
+
+// DEFAULT_LANGUAGE holds a code, not an id, so it has to be resolved.
+$dbl = new FakeDb();
+$dbl->when('/code = \'en\'/', [['languages_id' => '3']]);
+define('DEFAULT_LANGUAGE', 'en');
+
+T::is('resolves the configured code to its id', zc_default_language_id($dbl), 3);
+T::is('and is cached', count($dbl->matching('/FROM languages/')), 1);
+
+// The static cache means the fallbacks need their own process to be observed.
+$boot = 'require ' . var_export(__DIR__ . '/fakes.php', true) . ';'
+      . 'require ' . var_export(dirname(__DIR__) . '/freebooks-zencart.php', true) . ';';
+
+// A store whose configured code is not in the languages table at all.
+[$out] = run_in_child(
+    $boot
+    . 'define("DEFAULT_LANGUAGE", "xx");'
+    . '$d = new FakeDb();'
+    . '$d->when("/ORDER BY languages_id/", [["languages_id" => "7"]]);'
+    . 'echo zc_default_language_id($d);'
+);
+T::is('an unrecognised code falls back to the lowest installed language', $out, '7');
+
+// And the case that motivated all this: no language row with id 1.
+[$out] = run_in_child(
+    $boot
+    . '$d = new FakeDb();'
+    . '$d->when("/ORDER BY languages_id/", [["languages_id" => "4"]]);'
+    . 'echo zc_default_language_id($d);'
+);
+T::is('DEFAULT_LANGUAGE undefined also falls back, and never to a bare 1', $out, '4');
+
+// Only if there is no language at all does it give up and guess 1 -- which
+// cannot happen on a working store, but must not be a fatal if it does.
+[$out] = run_in_child($boot . '$d = new FakeDb(); echo zc_default_language_id($d);');
+T::is('an empty languages table does not fatal', $out, '1');
+
+// The point of the whole exercise: the option lookup must read in the same
+// language the inserts write, or it never finds what it just created.
+[$out] = run_in_child(
+    $boot
+    . 'define("DEFAULT_LANGUAGE", "en");'
+    . '$d = new FakeDb();'
+    . '$d->when("/code = .en./", [["languages_id" => "5"]]);'
+    . 'echo zc_default_language_id($d);'
+);
+T::is('a non-1 default is used verbatim', $out, '5');
+
+// The option resolvers are closures inside update_products(), so they cannot
+// be called directly without a large fixture. What can be checked cheaply is
+// that the literal never comes back: a source-level assertion, the same kind
+// that is worth having for any constant whose reappearance is silent.
+$src = (string)file_get_contents(dirname(__DIR__) . '/freebooks-zencart.php');
+
+T::is(
+    'no hard-coded language_id = 1 anywhere in the file',
+    preg_match('/language_id\s*=\s*1\b/', $src),
+    0
+);
+T::is(
+    'both option lookups read at the resolved default',
+    preg_match_all('/language_id = " \. \$default_lang/', $src),
+    2
+);
+T::ok(
+    'and the order-status lookup uses the helper',
+    strpos($src, 'language_id = " . zc_default_language_id($db)') !== false
+);
+// The inserts were already right -- one row per installed language. Pin that,
+// because "fixing" them to a single language would look like a simplification.
+T::is(
+    'option inserts still loop over every installed language',
+    preg_match_all('/SELECT languages_id FROM " \. TABLE_LANGUAGES\);/', $src),
+    2
+);
+
+
+// ===========================================================================
 T::group('hooks -- the seam stores are told to use');
 
 T::notOk('an unregistered hook does not report itself', zc_has_hook('nothing.here'));

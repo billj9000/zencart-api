@@ -387,6 +387,54 @@ function get_payment_ref($db, int $order_id, string $module): string
  * otherwise repeats the same handful of lookups thousands of times, and this
  * runs inside the loop that already had to be taught not to exhaust memory.
  */
+/**
+ * The store's default language id.
+ *
+ * Everything here that reads a name out of a *_description or *_options table
+ * has to pick a language, and there is no request context to take one from --
+ * these endpoints are called by an ERP, not by a browser with a session.
+ *
+ * This used to be the literal 1. That is right on a stock Zen Cart, where the
+ * English row is languages_id 1, and wrong the moment it is not. The failure
+ * is not a missing name, it is a DUPLICATE: $resolve_option() looks for an
+ * existing option at language 1, finds nothing because no such row exists,
+ * and creates a new one. Next sync it looks again, finds nothing again, and
+ * creates another. An option per sync, growing without bound, on a table the
+ * storefront reads to build every product page.
+ *
+ * DEFAULT_LANGUAGE holds a code ('en'), not an id, so it needs resolving. If
+ * that lookup fails too the fallback is the lowest installed language rather
+ * than 1 -- a store must have at least one language row, so the lowest one
+ * always exists, where id 1 might not.
+ */
+function zc_default_language_id($db): int
+{
+    static $id = null;
+
+    if ($id !== null) {
+        return $id;
+    }
+
+    $code = defined('DEFAULT_LANGUAGE') ? trim((string)DEFAULT_LANGUAGE) : '';
+
+    if ($code !== '') {
+        $row = $db->Execute(
+            "SELECT languages_id FROM " . TABLE_LANGUAGES
+            . " WHERE code = '" . zen_db_input($code) . "' LIMIT 1"
+        );
+        if (!$row->EOF) {
+            return $id = (int)$row->fields['languages_id'];
+        }
+    }
+
+    $row = $db->Execute(
+        "SELECT languages_id FROM " . TABLE_LANGUAGES . " ORDER BY languages_id LIMIT 1"
+    );
+
+    return $id = $row->EOF ? 1 : (int)$row->fields['languages_id'];
+}
+
+
 function zc_country_code($db, $country_name): string
 {
     static $cache = [];
@@ -507,7 +555,8 @@ function get_orders($db, int $last_order): void
         // Status name
         $status_row = $db->Execute(
             "SELECT orders_status_id, orders_status_name FROM " . TABLE_ORDERS_STATUS
-            . " WHERE language_id = 1 AND orders_status_id = " . (int)$result->fields['orders_status']
+            . " WHERE language_id = " . zc_default_language_id($db)
+            . "   AND orders_status_id = " . (int)$result->fields['orders_status']
             . " LIMIT 1"
         );
         $order_status    = $status_row->EOF ? 'unknown' : $status_row->fields['orders_status_name'];
@@ -1097,13 +1146,19 @@ function update_products($db, array $data): void
                 }
             }
 
-            // Resolve or create a products_options row by name (language_id=1).
+            // Language for READING option names back. The INSERTs below already
+            // write a row per installed language, which is correct; it is the
+            // lookup that has to agree with them, or an existing option is
+            // never found and a duplicate is created on every sync.
+            $default_lang = zc_default_language_id($db);
+
+            // Resolve or create a products_options row by name.
             // Returns the options_id.
-            $resolve_option = static function (string $name) use ($db): int {
+            $resolve_option = static function (string $name) use ($db, $default_lang): int {
                 $row = $db->Execute(
                     "SELECT products_options_id FROM " . TABLE_PRODUCTS_OPTIONS
                     . " WHERE products_options_name = '" . zen_db_input($name) . "'"
-                    . "   AND language_id = 1 LIMIT 1"
+                    . "   AND language_id = " . $default_lang . " LIMIT 1"
                 );
                 if (!$row->EOF) return (int)$row->fields['products_options_id'];
                 // removeFromQueryCache=true: this exact query text repeats across
@@ -1127,10 +1182,10 @@ function update_products($db, array $data): void
                 return $new_id;
             };
 
-            // Resolve or create a products_options_values row by name (language_id=1).
+            // Resolve or create a products_options_values row by name.
             // Ensures the join table row for (options_id, values_id) exists.
             // Returns the options_values_id.
-            $resolve_option_value = static function (string $name, int $options_id) use ($db): int {
+            $resolve_option_value = static function (string $name, int $options_id) use ($db, $default_lang): int {
                 // Find existing value by name, then verify it's linked to this option
                 $row = $db->Execute(
                     "SELECT v.products_options_values_id"
@@ -1139,7 +1194,7 @@ function update_products($db, array $data): void
                     . "   ON j.products_options_values_id = v.products_options_values_id"
                     . "   AND j.products_options_id = " . $options_id
                     . " WHERE v.products_options_values_name = '" . zen_db_input($name) . "'"
-                    . "   AND v.language_id = 1 LIMIT 1"
+                    . "   AND v.language_id = " . $default_lang . " LIMIT 1"
                 );
                 if (!$row->EOF) return (int)$row->fields['products_options_values_id'];
 
