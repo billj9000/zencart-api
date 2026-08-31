@@ -1,0 +1,186 @@
+<?php
+/**
+ * Tests for freebooks-zencart.php.
+ *
+ *   php tests/run.php
+ *
+ * No database, no web server, no Zen Cart installation: tests/fakes.php
+ * supplies the handful of constants and functions the file expects, plus a
+ * FakeDb that answers canned rows and records every statement.
+ *
+ * The file is included with ZC_API_LIB_ONLY defined, which skips its bootstrap
+ * and its router, so only the function definitions load.
+ *
+ * What this covers is the part where a wrong answer is expensive and silent:
+ * how a country name becomes an ISO code, which language rows get read and
+ * written, how a tax class is chosen, and the hook machinery that a store
+ * relies on to add its own behaviour without editing this file. It does not
+ * cover the HTTP surface or the SQL itself -- those need a real install.
+ */
+
+declare(strict_types=1);
+
+require __DIR__ . '/fakes.php';
+
+$db = new FakeDb();
+$GLOBALS['db'] = $db;
+
+require dirname(__DIR__) . '/freebooks-zencart.php';
+
+
+// ===========================================================================
+T::group('the file loads as a library');
+
+T::ok('helpers are defined', function_exists('zc_country_code'));
+// The router's first act is check_access($db), which queries. No statement at
+// all on include is therefore proof it did not run -- a better check than
+// headers_sent(), which is false under CLI regardless.
+T::is('the router did not run: no statement issued', $db->queries, []);
+T::ok('and no task was resolved', !isset($GLOBALS['task']));
+
+
+// ===========================================================================
+T::group('zc_country_code -- names to ISO alpha-2');
+
+$db->reset();
+$db->when('/countries_name = \'France\'/', [['countries_iso_code_2' => 'FR']]);
+
+T::is('a name in the table resolves', zc_country_code($db, 'France'), 'FR');
+T::is('and is cached, not re-queried', count($db->matching('/FROM countries/')), 1);
+
+$db->reset();
+T::is('the cache survives a reset of the db log', zc_country_code($db, 'France'), 'FR');
+T::is('with no further query', $db->queries, []);
+
+T::is('an empty name is not looked up', zc_country_code($db, ''), '');
+T::is('nor is whitespace', zc_country_code($db, "  \t "), '');
+T::is('still no query issued', $db->queries, []);
+
+// The alias table is the whole reason historical orders keep resolving after a
+// country is renamed in the countries table. An order placed in 2019 stores
+// the name as it was then, and that name is no longer in the table.
+$db->reset();
+foreach ([
+    'Czech Republic'                             => 'CZ',
+    'Turkey'                                     => 'TR',
+    'Cape Verde'                                 => 'CV',
+    'Swaziland'                                  => 'SZ',
+    'Macedonia, The Former Yugoslav Republic of' => 'MK',
+    'Slovakia (Slovak Republic)'                 => 'SK',
+    'Bosnia and Herzegowina'                     => 'BA',
+    'Guinea-bissau'                              => 'GW',
+    'Virgin Islands (British)'                   => 'VG',
+    'Vatican City State (Holy See)'              => 'VA',
+] as $old_name => $iso) {
+    T::is("alias: $old_name", zc_country_code($db, $old_name), $iso);
+}
+
+T::is('an unknown name yields no code rather than a guess', zc_country_code($db, 'Atlantis'), '');
+
+
+// ===========================================================================
+T::group('zc_order_country_code -- column if present, name if not');
+
+$db->reset();
+// No *_country_code column on the orders table, which is every stock Zen Cart.
+$db->when('/SHOW COLUMNS/', []);
+$db->when('/countries_name = \'Spain\'/', [['countries_iso_code_2' => 'ES']]);
+
+T::is(
+    'falls back to resolving the stored country name',
+    zc_order_country_code($db, ['delivery_country' => 'Spain'], 'delivery'),
+    'ES'
+);
+T::ok('and it did ask whether the column exists', $db->matching('/SHOW COLUMNS/') !== []);
+
+$db->reset();
+T::is('the column check is cached per prefix', zc_order_country_code($db, ['delivery_country' => 'Spain'], 'delivery'), 'ES');
+T::is('so SHOW COLUMNS is not repeated', $db->matching('/SHOW COLUMNS/'), []);
+
+$db2 = new FakeDb();
+$db2->when('/SHOW COLUMNS/', [['Field' => 'billing_country_code']]);
+T::is(
+    'a store that HAS the column gets the column',
+    zc_order_country_code($db2, ['billing_country' => 'France', 'billing_country_code' => 'FR'], 'billing'),
+    'FR'
+);
+T::is('and the countries table is not consulted', $db2->matching('/FROM countries/'), []);
+
+$db3 = new FakeDb();
+$db3->when('/SHOW COLUMNS/', [['Field' => 'billing_country_code']]);
+$db3->when('/countries_name = \'Italy\'/', [['countries_iso_code_2' => 'IT']]);
+T::is(
+    'an empty column value still falls back to the name',
+    zc_order_country_code($db3, ['billing_country' => 'Italy', 'billing_country_code' => ''], 'billing'),
+    'IT'
+);
+
+$db4 = new FakeDb();
+$db4->when('/SHOW COLUMNS/', []);
+T::is('a missing country field is not fatal', zc_order_country_code($db4, [], 'delivery'), '');
+
+
+// ===========================================================================
+T::group('hooks -- the seam stores are told to use');
+
+T::notOk('an unregistered hook does not report itself', zc_has_hook('nothing.here'));
+T::is('and filtering through it returns the value untouched', zc_filter('nothing.here', 'x'), 'x');
+
+zc_add_filter('order.item', static fn($item, $ctx) => array_merge((array)$item, ['seen' => true]));
+T::ok('a registered filter is reported', zc_has_hook('order.item'));
+T::is(
+    'and it can change the value',
+    zc_filter('order.item', ['sku' => 'A'], []),
+    ['sku' => 'A', 'seen' => true]
+);
+
+// Priority ordering matters: a store may register a coarse filter and then a
+// finer one that depends on running after it.
+zc_add_filter('chain', static fn($v) => $v . 'b', 20);
+zc_add_filter('chain', static fn($v) => $v . 'a', 10);
+zc_add_filter('chain', static fn($v) => $v . 'c', 30);
+T::is('filters run in priority order, not registration order', zc_filter('chain', ''), 'abc');
+
+// Actions and filters share one runner, so both callbacks are ($value, $ctx)
+// -- an action just gets null as the value. Worth pinning: writing an action
+// as fn($ctx) silently receives null and looks like the context is missing.
+$fired = [];
+zc_add_action('boot', static function ($value, $ctx) use (&$fired) {
+    $fired[] = [$value, $ctx['task'] ?? null];
+});
+zc_do_action('boot', ['task' => 'orders']);
+T::is('actions are called as ($value, $ctx), with a null value', $fired, [[null, 'orders']]);
+
+// A filter that forgets to return is the commonest hook mistake, and blanking
+// the value would corrupt what reaches the ERP.
+zc_add_filter('forgetful', static function ($v) { /* no return */ });
+T::is('a filter returning null keeps the previous value', zc_filter('forgetful', 'kept'), 'kept');
+
+// A throwing hook aborts the request with a 500 rather than carrying on.
+// That is the right call for an integration that moves money -- half-built
+// order data reaching the ERP is worse than an error the caller can retry --
+// but it does mean one bad hook file takes the endpoint down, so it is pinned
+// here deliberately rather than left to be discovered.
+[$out, $code] = run_in_child(
+    'require ' . var_export(__DIR__ . '/fakes.php', true) . ';'
+    . '$db = new FakeDb(); $GLOBALS["db"] = $db;'
+    . 'require ' . var_export(dirname(__DIR__) . '/freebooks-zencart.php', true) . ';'
+    . 'zc_add_filter("explodes", static function ($v) { throw new RuntimeException("bad hook"); });'
+    . 'zc_filter("explodes", "original");'
+    . 'echo "REACHED-THE-END";'
+);
+// Decode rather than string-match: the message is inside JSON, so its quotes
+// are escaped and a literal needle silently never matches.
+$body = json_decode(trim($out), true);
+
+T::ok('the child returned valid JSON', is_array($body));
+T::is('reported as a failure', $body['ok'] ?? null, false);
+T::is(
+    'naming the hook and the error',
+    $body['error'] ?? '',
+    'Hook "explodes" failed: bad hook'
+);
+T::notOk('and the request stopped rather than continuing', strpos($out, 'REACHED-THE-END'));
+
+
+exit(T::summary());

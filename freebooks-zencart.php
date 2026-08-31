@@ -31,10 +31,25 @@
  *  POST ?task=updateProductsQty     body: {"products":[{"products_model":"...","quantity":N,"price":N},...]}
  */
 
-require('includes/application_top.php');
+// ─── Bootstrap ────────────────────────────────────────────────────────────────
+//
+// Both the bootstrap and the router at the foot of this file are skipped when
+// ZC_API_LIB_ONLY is defined before including it. That lets the helpers below
+// be loaded on their own -- by the test suite in tests/, or by another script
+// that wants zc_country_code() and friends without serving a request.
+//
+// A constant rather than an is-this-file-the-entry-point check, because the
+// latter has to compare realpath() against SCRIPT_FILENAME or argv[0] and gets
+// it wrong under CLI servers, symlinked docroots and PHP-FPM. This file moves
+// money; predictable beats clever. Nothing outside PHP can define a constant,
+// so a request cannot switch the router off.
 
-header('Content-Type: application/json');
-header('X-Content-Type-Options: nosniff');
+if (!defined('ZC_API_LIB_ONLY')) {
+    require('includes/application_top.php');
+
+    header('Content-Type: application/json');
+    header('X-Content-Type-Options: nosniff');
+}
 
 define('ZC_API_VERSION', 4);
 define('ZC_DEFAULT_TAX_CLASS_ID', 1);
@@ -1367,6 +1382,11 @@ function update_products_qty($db, array $data): void
 }
 
 // ─── Router ───────────────────────────────────────────────────────────────────
+
+if (defined('ZC_API_LIB_ONLY')) {
+    return;
+}
+
 
 check_access($db);
 zc_load_hooks();
