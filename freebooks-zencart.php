@@ -223,7 +223,17 @@ function _zc_run(string $name, $value, array $ctx, bool $is_filter)
                 if ($result === null) {
                     // Forgetting `return` in a filter is the commonest hook bug —
                     // keep the previous value rather than silently blanking it.
-                    error_log('freebooks-zencart.php: filter "' . $name . '" returned null; ignoring and keeping previous value');
+                    //
+                    // But only complain when a real value would have been lost.
+                    // A filter chain that STARTS from null — order.total_line is
+                    // exactly that shape, with several hooks each claiming one
+                    // order-total class — uses null to mean "not mine", and
+                    // every hook that declines returns it. Warning on those
+                    // would put a line in the error log for every hook, on
+                    // every order-total row, of every order fetched.
+                    if ($value !== null) {
+                        error_log('freebooks-zencart.php: filter "' . $name . '" returned null; ignoring and keeping previous value');
+                    }
                 } else {
                     $value = $result;
                 }
@@ -779,18 +789,32 @@ function get_orders($db, int $last_order): void
         }
 
         // Order totals — coupon, shipping, and other fee modules as extra line items
+        // ORDER BY sort_order: the order the customer saw these lines in on the
+        // invoice, and therefore the order the ERP should see them in. It used
+        // to be an arbitrary row order, corrected afterwards by emitting
+        // through a hard-coded list of known classes -- which is exactly the
+        // coupling this file is trying to get rid of, and which silently put
+        // any hook-contributed line last no matter where it belonged.
         $totals_result = $db->Execute(
-            "SELECT class, title, value FROM " . TABLE_ORDERS_TOTAL . " WHERE orders_id = " . $order_id
+            "SELECT class, title, value FROM " . TABLE_ORDERS_TOTAL
+            . " WHERE orders_id = " . $order_id
+            . " ORDER BY sort_order, orders_total_id"
         );
-        $ot_extra = [];
-        $dest_country = $order['shippingAddress']['country'];
+        $ot_items = [];
         while (!$totals_result->EOF) {
             $ot_vat = $vat_rate;
             $raw    = (float)$totals_result->fields['value'];
             $title  = strip_tags($totals_result->fields['title']);
             switch ($totals_result->fields['class']) {
+                // Only order-total modules that ship WITH Zen Cart are named
+                // here. Anything else -- a store's duty, IOSS, insurance or
+                // fee module -- reaches the hook below instead. Naming a
+                // store's own modules in a shared file meant every install
+                // carried code for modules it did not have, and the store that
+                // did have them still could not change their treatment without
+                // editing this file.
                 case 'ot_coupon':
-                    $ot_extra['coupon'] = [
+                    $ot_items[] = [
                         'sku'       => 'Discount',
                         'name'      => $title,
                         'quantity'  => 1,
@@ -799,48 +823,17 @@ function get_orders($db, int $last_order): void
                     ];
                     break;
                 case 'ot_shipping':
+                    // Not a line item: shipping is a field on the order.
                     $order['shippingAmount'] = $raw / (1 + $ot_vat / 100);
                     $order['shippingTax']    = $ot_vat;
                     break;
-                case 'ot_taxamo_assure':
-                    if ($dest_country !== 'United Kingdom' && $vat_rate != 0) {
-                        $ot_extra['taxamo_assure'] = [
-                            'sku'       => 'VAT',
-                            'name'      => $title,
-                            'quantity'  => 1,
-                            'unitPrice' => $raw,
-                            'tax'       => 0.0,
-                        ];
-                    }
-                    break;
-                case 'ot_dhl_landedcost':
-                    if ($raw > 0.0) {
-                        $ot_extra['dhl_landedcost'] = [
-                            'sku'       => 'DHL_LANDEDCOST',
-                            'name'      => $title,
-                            'quantity'  => 1,
-                            'unitPrice' => $raw,
-                            'tax'       => 0.0,
-                        ];
-                    }
-                    break;
-                case 'ot_easproject_ioss':
-                    if ($raw > 0.0) {
-                        $ot_extra['easproject_ioss'] = [
-                            'sku'       => 'IOSS_VAT',
-                            'name'      => $title,
-                            'quantity'  => 1,
-                            'unitPrice' => $raw,
-                            'tax'       => 0.0,
-                        ];
-                    }
-                    break;
                 default:
-                    // Seam for store-specific order-total line items (e.g. a
-                    // custom fee/discount module) without editing this file.
-                    // Return an item array shaped like the ones above to have
-                    // it appended; anything else (including the default null)
-                    // is ignored.
+                    // Every other order-total module, including the ones this
+                    // store used to have hard-coded here. Return an item array
+                    // shaped like the one above to have it appended in
+                    // sort_order position; anything else (including the
+                    // default null) is ignored, which is what makes an
+                    // ot_subtotal or ot_total row correctly produce nothing.
                     $extra = zc_filter('order.total_line', null, [
                         'class'    => $totals_result->fields['class'],
                         'title'    => $title,
@@ -849,31 +842,23 @@ function get_orders($db, int $last_order): void
                         'order'    => $order,
                     ]);
                     if (is_array($extra)) {
-                        $ot_extra['hook_' . count($ot_extra)] = $extra;
+                        $ot_items[] = $extra;
                     }
                     break;
             }
             $totals_result->MoveNext();
         }
 
-        foreach (['coupon', 'taxamo_assure', 'dhl_landedcost', 'easproject_ioss'] as $key) {
-            if (isset($ot_extra[$key])) {
-                $items[] = $ot_extra[$key];
-            }
-        }
-        foreach ($ot_extra as $key => $extra_item) {
-            if (strpos($key, 'hook_') === 0) {
-                $items[] = $extra_item;
-            }
+        foreach ($ot_items as $ot_item) {
+            $items[] = $ot_item;
         }
 
-        if (isset($ot_extra['taxamo_assure']) && class_exists('taxamo_assure')) {
-            $taxamo = new taxamo_assure();
-            $tx = $taxamo->GetOrderTransaction($order_id);
-            if ($tx !== null) {
-                $order['taxamoAssure'] = $tx;
-            }
-        }
+        // A block that attached Taxamo Assure transaction details to the order
+        // used to sit here. It was store-specific in a shared file, and it
+        // instantiated a class that only one install has ever had. Removed
+        // rather than guarded: the `order` filter a few lines below receives
+        // the whole order and can add any such field, which is where this
+        // belongs for any store still running that module.
 
         $order['items'] = $items;
         $orders[]       = zc_filter('order', $order, ['row' => $result->fields]);

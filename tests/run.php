@@ -318,6 +318,44 @@ T::is('actions are called as ($value, $ctx), with a null value', $fired, [[null,
 zc_add_filter('forgetful', static function ($v) { /* no return */ });
 T::is('a filter returning null keeps the previous value', zc_filter('forgetful', 'kept'), 'kept');
 
+// ...and it says so, because a filter that silently drops its value is the
+// hardest hook bug to find.
+$logfile = tempnam(sys_get_temp_dir(), 'zclog');
+[$out] = run_in_child(
+    'ini_set("error_log", ' . var_export($logfile, true) . ');'
+    . 'require ' . var_export(__DIR__ . '/fakes.php', true) . ';'
+    . 'require ' . var_export(dirname(__DIR__) . '/freebooks-zencart.php', true) . ';'
+    . 'zc_add_filter("f", static function ($v) {});'
+    . 'zc_filter("f", "kept");'
+    . 'echo trim(file_get_contents(' . var_export($logfile, true) . '));'
+);
+T::ok('discarding a real value is logged', strpos($out, 'returned null') !== false);
+
+// But a chain that starts from null uses null to mean "not mine". Several
+// hooks each claim one order-total class, so every hook that declines returns
+// null -- warning on those would log once per hook, per order-total row, per
+// order fetched.
+$logfile2 = tempnam(sys_get_temp_dir(), 'zclog');
+[$out] = run_in_child(
+    'ini_set("error_log", ' . var_export($logfile2, true) . ');'
+    . 'require ' . var_export(__DIR__ . '/fakes.php', true) . ';'
+    . 'require ' . var_export(dirname(__DIR__) . '/freebooks-zencart.php', true) . ';'
+    . 'zc_add_filter("order.total_line", static fn($i, $c) => $c["class"] === "mine" ? ["sku" => "X"] : $i);'
+    . 'zc_add_filter("order.total_line", static fn($i, $c) => $i);'
+    . '$r = zc_filter("order.total_line", null, ["class" => "not-mine"]);'
+    . 'echo var_export($r, true) . "|" . trim(@file_get_contents(' . var_export($logfile2, true) . '));'
+);
+T::is('declining a null-started chain returns null and logs nothing', $out, 'NULL|');
+
+[$out] = run_in_child(
+    'require ' . var_export(__DIR__ . '/fakes.php', true) . ';'
+    . 'require ' . var_export(dirname(__DIR__) . '/freebooks-zencart.php', true) . ';'
+    . 'zc_add_filter("order.total_line", static fn($i, $c) => $c["class"] === "mine" ? ["sku" => "X"] : $i);'
+    . 'zc_add_filter("order.total_line", static fn($i, $c) => $i);'
+    . 'echo json_encode(zc_filter("order.total_line", null, ["class" => "mine"]));'
+);
+T::is('and a later declining hook does not undo an earlier claim', $out, '{"sku":"X"}');
+
 // A throwing hook aborts the request with a 500 rather than carrying on.
 // That is the right call for an integration that moves money -- half-built
 // order data reaching the ERP is worse than an error the caller can retry --
