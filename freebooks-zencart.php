@@ -52,7 +52,13 @@ if (!defined('ZC_API_LIB_ONLY')) {
 }
 
 define('ZC_API_VERSION', 4);
-define('ZC_DEFAULT_TAX_CLASS_ID', 1);
+// Tax class for taxable products, by TITLE rather than id -- see
+// zc_tax_class_id(). Left empty by default, which means "use whichever class
+// the store has"; set it only where a store has several and the ERP does not
+// say which. Guarded, so it can be pre-defined by an auto_prepend file.
+if (!defined('ZC_DEFAULT_TAX_CLASS_TITLE')) {
+    define('ZC_DEFAULT_TAX_CLASS_TITLE', '');
+}
 
 // ─── Response helpers ────────────────────────────────────────────────────────
 
@@ -432,6 +438,94 @@ function zc_default_language_id($db): int
     );
 
     return $id = $row->EOF ? 1 : (int)$row->fields['languages_id'];
+}
+
+
+/**
+ * A tax class id from its title, or 0 if there is no such class.
+ */
+function zc_tax_class_by_title($db, string $title): int
+{
+    static $cache = [];
+
+    $title = trim($title);
+
+    if ($title === '') {
+        return 0;
+    }
+
+    if (isset($cache[$title])) {
+        return $cache[$title];
+    }
+
+    $row = $db->Execute(
+        "SELECT tax_class_id FROM " . TABLE_TAX_CLASS
+        . " WHERE tax_class_title = '" . zen_db_input($title) . "' LIMIT 1"
+    );
+
+    return $cache[$title] = $row->EOF ? 0 : (int)$row->fields['tax_class_id'];
+}
+
+
+/**
+ * Which tax class a product should carry. 0 means "not taxed".
+ *
+ * This used to be the constant 1, on the reasoning that a stock Zen Cart puts
+ * "Taxable Goods" at tax_class_id 1. Two things wrong with that. The id is an
+ * auto_increment with no guarantee attached, and the TITLE is not fixed either
+ * -- this very store calls its only class "VAT", not "Taxable Goods". So
+ * neither the id nor a hard-coded title can be assumed, and the resolution has
+ * to be a ladder:
+ *
+ *   1. the class the payload names, if it names one
+ *   2. ZC_DEFAULT_TAX_CLASS_TITLE, if the install sets one
+ *   3. the store's lowest tax_class_id -- correct wherever there is only one,
+ *      which is the overwhelmingly common case
+ *
+ * A title the payload asks for and the store does not have is an error rather
+ * than a fallback: the ERP asked for something specific, and quietly taxing at
+ * some other rate is the kind of wrong that shows up in a VAT return months
+ * later. Same reasoning for a taxable product on a store with no tax classes
+ * at all.
+ *
+ * Overridable per product through the product.tax_class_id filter.
+ */
+function zc_tax_class_id($db, array $product, string $sku): int
+{
+    if (empty($product['productTaxable'])) {
+        return (int)zc_filter('product.tax_class_id', 0, ['sku' => $sku, 'product' => $product]);
+    }
+
+    $asked = trim((string)($product['taxClass'] ?? ''));
+
+    if ($asked !== '') {
+        $id = zc_tax_class_by_title($db, $asked);
+        if ($id === 0) {
+            api_error('Unrecognised tax class "' . $asked . '" on ' . $sku);
+        }
+        return (int)zc_filter('product.tax_class_id', $id, ['sku' => $sku, 'product' => $product]);
+    }
+
+    if (ZC_DEFAULT_TAX_CLASS_TITLE !== '') {
+        $id = zc_tax_class_by_title($db, ZC_DEFAULT_TAX_CLASS_TITLE);
+        if ($id !== 0) {
+            return (int)zc_filter('product.tax_class_id', $id, ['sku' => $sku, 'product' => $product]);
+        }
+    }
+
+    $row = $db->Execute(
+        "SELECT tax_class_id FROM " . TABLE_TAX_CLASS . " ORDER BY tax_class_id LIMIT 1"
+    );
+
+    if ($row->EOF) {
+        api_error('Product ' . $sku . ' is taxable but this store has no tax classes');
+    }
+
+    return (int)zc_filter(
+        'product.tax_class_id',
+        (int)$row->fields['tax_class_id'],
+        ['sku' => $sku, 'product' => $product]
+    );
 }
 
 
@@ -965,7 +1059,6 @@ function update_products($db, array $data): void
         }
 
         // Build products table row
-        $tax_class_id = !empty($product['productTaxable']) ? ZC_DEFAULT_TAX_CLASS_ID : 0;
         $prod_row = [
             'products_model'       => $sku,
             'products_type'        => $type_id,
@@ -1035,8 +1128,29 @@ function update_products($db, array $data): void
             $prod_row['hs_code']                  = $product['productHsCode'];
         if (isset($product['productCountryOrigin']) && $has_country_of_origin)
             $prod_row['country_of_origin']        = $product['productCountryOrigin'];
-        if ($tax_class_id)
-            $prod_row['products_tax_class_id']    = $tax_class_id;
+        // array_key_exists, not isset() or a truthiness test on the resolved id.
+        //
+        // The old line was `if ($tax_class_id)`, which skipped the assignment
+        // whenever the class came out as 0. On an UPDATE that leaves the
+        // existing value untouched, so marking a taxable product as no longer
+        // taxable did nothing at all -- silently, and permanently.
+        //
+        // But it cannot simply always be written either. A payload that omits
+        // productTaxable must leave the column alone: this store has 18,120 of
+        // 18,122 products in one tax class, and writing 0 for an absent field
+        // would untax the entire catalogue in a single sync. So the field being
+        // PRESENT is what authorises the write, exactly as for every other
+        // optional column in this array.
+        if (array_key_exists('productTaxable', $product)) {
+            $tax_class_id = zc_tax_class_id($db, $product, $sku);
+            $prod_row['products_tax_class_id'] = $tax_class_id;
+
+            // A sync that untaxes something should be findable afterwards
+            // without diffing the catalogue.
+            if ($tax_class_id === 0) {
+                error_log('freebooks-zencart.php: clearing tax class on ' . $sku . ' (productTaxable is false)');
+            }
+        }
 
         if (!empty($product['priceDiscountType'])) {
             $prod_row['products_discount_type']      = (int)$product['priceDiscountType'];

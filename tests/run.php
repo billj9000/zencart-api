@@ -200,6 +200,89 @@ T::is(
 
 
 // ===========================================================================
+T::group('zc_tax_class_id -- the ladder, not a constant');
+
+$boot2 = 'require ' . var_export(__DIR__ . '/fakes.php', true) . ';'
+       . 'require ' . var_export(dirname(__DIR__) . '/freebooks-zencart.php', true) . ';';
+
+// One class, titled whatever the store felt like -- 'VAT' here, which is what
+// production actually calls it, not Zen Cart's stock 'Taxable Goods'.
+$one_class = '$d = new FakeDb();'
+           . '$d->when("/ORDER BY tax_class_id/", [["tax_class_id" => "1"]]);'
+           . '$d->when("/tax_class_title = .VAT./", [["tax_class_id" => "1"]]);';
+
+[$out] = run_in_child($boot2 . $one_class
+    . 'echo zc_tax_class_id($d, ["productTaxable" => 1], "SKU1");');
+T::is('a taxable product gets the store\'s only class', $out, '1');
+
+[$out] = run_in_child($boot2 . $one_class
+    . 'echo zc_tax_class_id($d, ["productTaxable" => 0], "SKU1");');
+T::is('a non-taxable product gets 0', $out, '0');
+
+[$out] = run_in_child($boot2 . $one_class
+    . 'echo zc_tax_class_id($d, ["productTaxable" => 1, "taxClass" => "VAT"], "SKU1");');
+T::is('a payload naming a class it has gets that class', $out, '1');
+
+// The ladder must not silently substitute. Asking for a class the store does
+// not have is an ERP data error, and taxing at some other rate instead is the
+// kind of wrong that only surfaces in a VAT return.
+[$out] = run_in_child($boot2 . $one_class
+    . 'echo zc_tax_class_id($d, ["productTaxable" => 1, "taxClass" => "Reduced"], "SKU9");');
+$body = json_decode(trim($out), true);
+T::is('an unknown named class is an error', $body['ok'] ?? null, false);
+T::ok('naming the class and the SKU', strpos($body['error'] ?? '', 'Reduced') !== false
+                                   && strpos($body['error'] ?? '', 'SKU9') !== false);
+
+// A store with no tax classes cannot have a taxable product.
+[$out] = run_in_child($boot2
+    . '$d = new FakeDb();'
+    . 'echo zc_tax_class_id($d, ["productTaxable" => 1], "SKU2");');
+$body = json_decode(trim($out), true);
+T::is('taxable with no classes at all is an error, not a 0', $body['ok'] ?? null, false);
+T::ok('and says so plainly', strpos($body['error'] ?? '', 'no tax classes') !== false);
+
+// A store with several classes picks the lowest id, unless told otherwise.
+$many = '$d = new FakeDb();'
+      . '$d->when("/tax_class_title = .Reduced./", [["tax_class_id" => "7"]]);'
+      . '$d->when("/ORDER BY tax_class_id/", [["tax_class_id" => "2"]]);';
+
+[$out] = run_in_child($boot2 . $many
+    . 'echo zc_tax_class_id($d, ["productTaxable" => 1], "SKU3");');
+T::is('several classes and no preference: lowest id', $out, '2');
+
+[$out] = run_in_child($boot2 . $many
+    . 'echo zc_tax_class_id($d, ["productTaxable" => 1, "taxClass" => "Reduced"], "SKU3");');
+T::is('and the payload can still pick another', $out, '7');
+
+// ZC_DEFAULT_TAX_CLASS_TITLE sits between the two.
+[$out] = run_in_child(
+    'define("ZC_DEFAULT_TAX_CLASS_TITLE", "Reduced");' . $boot2 . $many
+    . 'echo zc_tax_class_id($d, ["productTaxable" => 1], "SKU4");');
+T::is('a configured default title wins over the lowest id', $out, '7');
+
+// ...but a configured title the store does not have must not be fatal: it is
+// install configuration, not payload data, and the store still has a class.
+[$out] = run_in_child(
+    'define("ZC_DEFAULT_TAX_CLASS_TITLE", "Nonexistent");' . $boot2 . $many
+    . 'echo zc_tax_class_id($d, ["productTaxable" => 1], "SKU5");');
+T::is('a configured title that does not resolve falls through', $out, '2');
+
+// The filter is the per-product override.
+[$out] = run_in_child($boot2 . $one_class
+    . 'zc_add_filter("product.tax_class_id", static fn($id, $ctx) => $ctx["sku"] === "ZERO" ? 0 : $id);'
+    . 'echo zc_tax_class_id($d, ["productTaxable" => 1], "ZERO");');
+T::is('a filter can override the resolved class', $out, '0');
+
+// The old constant must not come back.
+$src = (string)file_get_contents(dirname(__DIR__) . '/freebooks-zencart.php');
+T::notOk('ZC_DEFAULT_TAX_CLASS_ID is gone', strpos($src, 'ZC_DEFAULT_TAX_CLASS_ID'));
+T::ok(
+    'and the column is written on presence of the field, not truthiness of the id',
+    strpos($src, "array_key_exists('productTaxable', \$product)") !== false
+);
+
+
+// ===========================================================================
 T::group('hooks -- the seam stores are told to use');
 
 T::notOk('an unregistered hook does not report itself', zc_has_hook('nothing.here'));
