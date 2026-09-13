@@ -383,4 +383,99 @@ T::is(
 T::notOk('and the request stopped rather than continuing', strpos($out, 'REACHED-THE-END'));
 
 
+// ===========================================================================
+T::group('bundle pieces -- absent, empty and populated are three different things');
+
+$src = (string)file_get_contents(dirname(__DIR__) . '/freebooks-zencart.php');
+
+T::ok(
+    'presence of the field authorises the write, not its truthiness',
+    strpos($src, "array_key_exists('bundleComponents', \$product)") !== false
+);
+T::notOk(
+    'so an empty list is never mistaken for the field being absent',
+    preg_match('/!empty\(\$product\[.bundleComponents.\]\)/', $src)
+);
+T::ok(
+    'and the list is filterable before it is written',
+    strpos($src, "zc_filter('product.bundle_pieces'") !== false
+);
+
+// update_products() ends in api_ok(), which exits, so it cannot be called in
+// process. products.response is the last filter to run before that exit, which
+// makes it the seam a test can read the finished SQL from.
+//
+// The product is made to already exist: zen_db_insert_id() is not faked, so the
+// insert path is not observable here, and the update path is the one a sync
+// actually takes for an established catalogue anyway.
+$bundle_sql = static function ($bundle, bool $table_exists): array {
+    $product = [
+        'products_model'  => 'SVK101',
+        'productType'     => 'Product - General',
+        'productCategory' => 'All',
+    ];
+    if ($bundle !== 'ABSENT') {
+        $product['bundleComponents'] = $bundle;
+    }
+
+    $canned = [
+        '/FROM languages WHERE code/'        => [['languages_id' => 1]],
+        '/FROM product_types/'               => [['type_id' => 1]],
+        '/FROM categories_description/'      => [['categories_id' => 5]],
+        '/SELECT products_id FROM products/' => [['products_id' => 42]],
+    ];
+    // Absent from $canned means SHOW TABLES answers empty, which is how a store
+    // without the optional table looks.
+    if ($table_exists) {
+        $canned['/SHOW TABLES LIKE .*products_bundle_components/'] = [['t' => 'y']];
+    }
+
+    $php = 'require ' . var_export(__DIR__ . '/fakes.php', true) . ';'
+        . '$db = new FakeDb(); $GLOBALS["db"] = $db;';
+    foreach ($canned as $pattern => $rows) {
+        $php .= '$db->when(' . var_export($pattern, true) . ', ' . var_export($rows, true) . ');';
+    }
+    $php .= 'require ' . var_export(dirname(__DIR__) . '/freebooks-zencart.php', true) . ';'
+        . 'zc_add_filter("products.response", static function ($v) use ($db) {'
+        . ' echo "SQL:" . json_encode($db->matching('
+        . var_export('/^(DELETE|INSERT).*products_bundle_components/', true)
+        . ')) . "\n"; return $v; });'
+        . 'update_products($db, ' . var_export(['products' => [$product]], true) . ');';
+
+    [$out] = run_in_child($php);
+
+    foreach (explode("\n", $out) as $line) {
+        if (strpos($line, 'SQL:') === 0) {
+            return json_decode(substr($line, 4), true) ?? [];
+        }
+    }
+    return ['no marker in child output: ' . $out];
+};
+
+$two_pieces = [
+    ['sku' => 'SB000254', 'qty' => 1, 'length' => 18, 'width' => 18, 'height' => 14.5, 'weight' => 0.42],
+    ['sku' => 'BP6ES',    'qty' => 4, 'length' => 0,  'width' => 0,  'height' => 0,    'weight' => 0.05],
+];
+
+T::is('an absent field touches nothing', $bundle_sql('ABSENT', true), []);
+
+$cleared = $bundle_sql([], true);
+T::is('an empty list issues exactly one statement', count($cleared), 1);
+T::is(
+    'and it is the DELETE, so the bundle falls back to its own dimensions',
+    $cleared[0] ?? '',
+    'DELETE FROM products_bundle_components WHERE products_id = 42'
+);
+
+$written = $bundle_sql($two_pieces, true);
+T::is('a populated list replaces wholesale: one DELETE, one INSERT per piece', count($written), 3);
+T::ok('pieces are numbered in the order sent', strpos($written[2] ?? '', ", 1, 'BP6ES'") !== false);
+T::ok('a fractional dimension survives intact', strpos($written[1] ?? '', '14.5') !== false);
+T::ok('and a zero dimension is stored as sent, not invented', strpos($written[2] ?? '', ", 0, 0, 0, 0.05)") !== false);
+
+// The whole point of the SHOW TABLES probe: a store that never created the
+// table must be unaffected by an ERP that sends the field regardless.
+T::is('without the table, a full list still writes nothing', $bundle_sql($two_pieces, false), []);
+
+
 exit(T::summary());

@@ -905,8 +905,17 @@ function update_products($db, array $data): void
     if (!defined('TABLE_PRODUCTS_DISCOUNT_QUANTITY')) {
         define('TABLE_PRODUCTS_DISCOUNT_QUANTITY', DB_PREFIX . 'products_discount_quantity');
     }
+    if (!defined('TABLE_PRODUCTS_BUNDLE_COMPONENTS')) {
+        define('TABLE_PRODUCTS_BUNDLE_COMPONENTS', DB_PREFIX . 'products_bundle_components');
+    }
     $tbl_check = $db->Execute("SHOW TABLES LIKE '" . DB_PREFIX . "products_discount_quantity'");
     $has_qty_discount_table = !$tbl_check->EOF;
+    // Bundle shipping pieces -- what a bundle product's parcel actually holds,
+    // for a shipping module that packs by volume. The table is optional
+    // (schema/products_bundle_components.sql); without it the payload field is
+    // ignored rather than erroring, so a store with no use for it does nothing.
+    $bundle_check = $db->Execute("SHOW TABLES LIKE '" . DB_PREFIX . "products_bundle_components'");
+    $has_bundle_table = !$bundle_check->EOF;
 
     $col = static function (string $col) use ($db): bool {
         return !$db->Execute("SHOW COLUMNS FROM " . TABLE_PRODUCTS . " LIKE '" . $col . "'")->EOF;
@@ -1217,6 +1226,65 @@ function update_products($db, array $data): void
                         . ", discount_price = " . (float)($tier['amount'] ?? 0)
                     );
                 }
+            }
+        }
+
+        // ── Bundle shipping pieces ─────────────────────────────────────────────
+        // Wiped and rewritten like the discount tiers above, and for the same
+        // reason: the ERP owns the list, so what it sends is the whole of it.
+        //
+        // array_key_exists, not isset() and not !empty(). Three states, each
+        // meaning something different:
+        //
+        //   field absent   the ERP said nothing about packing -- leave the rows
+        //   []             the bundle ships as one parcel -- clear the rows
+        //   [ ... ]        these are the pieces
+        //
+        // !empty() would collapse the first two, so a bundle switched to "ships
+        // complete" would go on being packed as loose parts for ever, quoting
+        // for a box it never travels in. Same trap as productTaxable above, and
+        // the same fix.
+        if ($has_bundle_table && array_key_exists('bundleComponents', $product)) {
+            $pieces = is_array($product['bundleComponents']) ? $product['bundleComponents'] : [];
+            $pieces = zc_filter('product.bundle_pieces', $pieces, [
+                'products_id' => $prod_id,
+                'sku'         => $sku,
+                'product'     => $product,
+                'is_new'      => $is_new,
+            ]);
+            if (!is_array($pieces)) {
+                $pieces = [];
+            }
+
+            $db->Execute(
+                "DELETE FROM " . TABLE_PRODUCTS_BUNDLE_COMPONENTS
+                . " WHERE products_id = " . $prod_id
+            );
+
+            $piece_no = 0;
+            foreach ($pieces as $piece) {
+                if (!is_array($piece)) {
+                    continue;
+                }
+                // sku is stored for diagnostics only. Nothing joins on it, and a
+                // piece need not exist in the catalogue as a product of its own,
+                // so it is deliberately NOT put through sku.import -- that filter
+                // maps an ERP SKU onto a Zen Cart products_model, which is a
+                // question this column is not asking.
+                $db->Execute(
+                    "INSERT INTO " . TABLE_PRODUCTS_BUNDLE_COMPONENTS
+                    . " (products_id, sort_order, sku, quantity, length, width, height, weight)"
+                    . " VALUES (" . $prod_id
+                    . ", " . $piece_no
+                    . ", '" . zen_db_input((string)($piece['sku'] ?? '')) . "'"
+                    . ", " . (float)($piece['qty']    ?? 1)
+                    . ", " . (float)($piece['length'] ?? 0)
+                    . ", " . (float)($piece['width']  ?? 0)
+                    . ", " . (float)($piece['height'] ?? 0)
+                    . ", " . (float)($piece['weight'] ?? 0)
+                    . ")"
+                );
+                $piece_no++;
             }
         }
 

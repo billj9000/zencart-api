@@ -25,6 +25,14 @@ Zen Cart web root (same level as `index.php`).
       'Secret key for FreeBooks ERP integration', 1, 100, NOW());
    ```
 4. Callers must send `Authorization: Bearer <your-key>`.
+5. *Optional.* If anything on your store packs a bundle's parts separately — a
+   dimensional shipping module, typically — create the table that holds them:
+   ```
+   mysql <database> < schema/products_bundle_components.sql
+   ```
+   Skip it and `bundleComponents` in an `updateProducts` payload is ignored;
+   nothing else changes, and no existing install grows a table it never asked
+   for. See [Bundle shipping pieces](#bundle-shipping-pieces).
 
 ### Endpoints (all via `?task=<name>`)
 
@@ -38,6 +46,46 @@ Zen Cart web root (same level as `index.php`).
 
 Any other `task` value 404s, unless a hook has registered a `task.<name>` action
 (see below).
+
+### Bundle shipping pieces
+
+A product sold as one line is not always shipped as one parcel. A shipping module
+that packs by volume needs the individual pieces, or it quotes for a box nothing
+actually travels in. The ERP is where a bundle's composition lives, so it sends the
+pieces alongside the product, on any `updateProducts` entry:
+
+```json
+{
+  "products_model": "SVK101",
+  "productWeight": 0.918,
+  "bundleComponents": [
+    {"sku": "SB000254", "qty": 1, "length": 18, "width": 18, "height": 14.5, "weight": 0.42},
+    {"sku": "BP6ES",    "qty": 4, "length": 0,  "width": 0,  "height": 0,    "weight": 0.05}
+  ]
+}
+```
+
+Dimensions are in the store's own dimension unit, weight in kg — the same units as
+`productZencartLength` and `productWeight`. Zeroes are stored as sent and pack as
+zero volume, which is the honest answer when the ERP holds no figures, rather than
+a guess dressed up as data.
+
+Three states, each meaning something different:
+
+| Sent | Meaning | Effect |
+|---|---|---|
+| field absent | the ERP said nothing about packing | existing rows left alone |
+| `[]` | the bundle ships as one parcel | rows cleared; packs on the product's own weight and dimensions |
+| `[ … ]` | these are the pieces | rows replaced wholesale |
+
+These are shipping *pieces*, not a bill of materials. A bundle that travels as one
+carton plus a loose length of pipe is two pieces, whatever its parts list says —
+which is why the ERP decides what to send rather than this file deriving it. `sku`
+is carried for diagnostics only: nothing joins on it, it is not passed through
+`sku.import`, and a piece need not exist in the catalogue as a product at all.
+
+Requires the optional table from step 5 of [Installation](#installation); without it
+the field is ignored.
 
 ## Customisation hooks
 
@@ -124,6 +172,7 @@ applicable) and `source_sku` (as the ERP sent it).
 | `product.row` | filter | the `products` table row about to be written; ctx `product`, `sku`, `lang_id`, `is_new`, `products_id` (`null` for a new product) |
 | `product.desc_row` | filter | the `products_description` row about to be written; same ctx as `product.row` |
 | `product.saved` | action | after the product/description/category rows are written; ctx `products_id`, `sku`, `product`, `is_new`, `lang_id` |
+| `product.bundle_pieces` | filter | the shipping pieces about to be written for a bundle, before the rows are replaced — merge small parts into one piece, add packaging, drop something that ships separately. Only fires when the payload carries `bundleComponents` **and** the optional table exists; return `[]` to pack the product as a single parcel. ctx `products_id`, `sku`, `product`, `is_new` |
 | `products.response` | filter | the whole `{"added":[...],"updated":[...],"notUpdated":[...]}` body |
 
 **Quantity sync** (`?task=updateProductsQty`):
