@@ -1,10 +1,7 @@
 # zencart-api
 
-Zen Cart-side API endpoints for talking to external ERPs, meant to be dropped into a
-Zen Cart web root (same level as `index.php`).
-
-- **`freebooks-zencart.php`** — the FreeBooks ERP integration. Documented below.
-- **`erpnext-zencart.php`** — an older ERPNext connector, kept for reference.
+The Zen Cart side of the FreeBooks ERP integration: `freebooks-zencart.php`, an API endpoint
+meant to be dropped into a Zen Cart web root (same level as `index.php`).
 
 ## freebooks-zencart.php
 

@@ -205,8 +205,8 @@ T::group('zc_tax_class_id -- the ladder, not a constant');
 $boot2 = 'require ' . var_export(__DIR__ . '/fakes.php', true) . ';'
        . 'require ' . var_export(dirname(__DIR__) . '/freebooks-zencart.php', true) . ';';
 
-// One class, titled whatever the store felt like -- 'VAT' here, which is what
-// production actually calls it, not Zen Cart's stock 'Taxable Goods'.
+// One class, titled whatever the store felt like -- 'VAT' here, not Zen Cart's
+// stock 'Taxable Goods'.
 $one_class = '$d = new FakeDb();'
            . '$d->when("/ORDER BY tax_class_id/", [["tax_class_id" => "1"]]);'
            . '$d->when("/tax_class_title = .VAT./", [["tax_class_id" => "1"]]);';
